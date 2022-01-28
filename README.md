@@ -1,0 +1,6 @@
+Under construction....
+ESP8266 based Energy meter (Shelly 3EM) reading...
+
+# Thanks
+    - https://github.com/me-no-dev/ESPAsyncWebServer
+    - https://arduinojson.org/ 
