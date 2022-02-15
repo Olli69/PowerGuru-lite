@@ -5,9 +5,11 @@
 #include <math.h> //round
 #include <EEPROM.h>
 
-#include <DNSServer.h> // for captive portal
+#include <LittleFS.h>
 
-#ifdef ESP32 //not fully implemented with ESP32
+//#include <DNSServer.h> // for captive portal
+
+#ifdef ESP32 // not fully implemented with ESP32
 #include <WiFi.h>
 #include <AsyncTCP.h>
 #elif defined(ESP8266) // tested only with ESP8266
@@ -33,7 +35,7 @@ WiFiUDP ntpUDP;
 NTPClient timeClient(ntpUDP, "europe.pool.ntp.org");
 #endif
 
-DNSServer dnsServer;
+// DNSServer dnsServer;
 AsyncWebServer server(80);
 
 // client
@@ -62,6 +64,7 @@ float ds18B20_temp_c;
 
 #ifdef QUERY_POWERGURU
 // char powerguru_url[] = "http://192.168.66.8:8080/state_series?price_area=FI";
+const char *pg_state_cache_filename = "/pg_state_cache.json";
 
 unsigned powerguru_interval_s = 3600;
 unsigned long powerguru_last = -powerguru_interval_s * 1000; //
@@ -98,12 +101,12 @@ typedef struct
 
 } channel_struct;
 
-//TODO: add fixed ip, subnet?
+// TODO: add fixed ip, subnet?
 typedef struct
 {
   bool sta_mode;
   char wifi_ssid[MAX_ID_STR_LENGTH];
-  char wifi_password[MAX_ID_STR_LENGTH];  
+  char wifi_password[MAX_ID_STR_LENGTH];
   char http_username[MAX_ID_STR_LENGTH];
   char http_password[MAX_ID_STR_LENGTH];
   channel_struct ch[CHANNELS];
@@ -195,7 +198,7 @@ void notFound(AsyncWebServerRequest *request)
   request->send(404, "text/plain", "Not found");
 }
 
-String httpGETRequest(const char *url)
+String httpGETRequest(const char *url, const char *cache_file_name)
 {
   WiFiClient client;
   HTTPClient http;
@@ -203,6 +206,8 @@ String httpGETRequest(const char *url)
   // Your IP address with path or Domain name with URL path
   http.begin(client, url);
 
+  Serial.println(url);
+  Serial.println(cache_file_name);
   // Send HTTP POST request
   int httpResponseCode = http.GET();
 
@@ -211,6 +216,31 @@ String httpGETRequest(const char *url)
   if (httpResponseCode > 0)
   {
     payload = http.getString();
+    // write to a cache file
+    if (strlen(cache_file_name) > 0)
+    {
+      // Delete existing file, otherwise the configuration is appended to the file
+      LittleFS.remove(cache_file_name);
+
+      // Open file for writing
+      File cache_file = LittleFS.open(cache_file_name, "w");
+      if (!cache_file)
+      {
+        Serial.println(F("Failed to create file:"));
+        Serial.print(cache_file_name);
+        Serial.print(", ");
+        Serial.println(cache_file);
+        return String("");
+      }
+      int bytesWritten = cache_file.print(http.getString());
+      Serial.print(F("Wrote to cache file bytes:"));
+      Serial.println(bytesWritten);
+
+      if (bytesWritten > 0)
+      { // write failed
+        cache_file.close();
+      }
+    }
   }
   else
   {
@@ -249,7 +279,7 @@ void read_meter_shelly3em()
 
   // sensorReadings = ;
 
-  DeserializationError error = deserializeJson(doc, httpGETRequest(s.shelly_url));
+  DeserializationError error = deserializeJson(doc, httpGETRequest(s.shelly_url, ""));
   if (error)
   {
     Serial.print(F("Meter deserializeJson() failed: "));
@@ -302,40 +332,92 @@ void read_meter_shelly3em()
 
 #ifdef QUERY_POWERGURU
 
+bool is_cache_file_valid(const char *cache_file_name, unsigned long max_age_sec)
+{
+  StaticJsonDocument<16> filter;
+  filter["ts"] = true; // first get timestamp field
+
+  File cache_file = LittleFS.open(cache_file_name, "r");
+  if (!cache_file)
+  { // failed to open the file, retrn empty result
+    return false;
+  }
+  StaticJsonDocument<50> doc_ts;
+
+  DeserializationError error = deserializeJson(doc_ts, cache_file, DeserializationOption::Filter(filter));
+  cache_file.close();
+
+  if (error)
+  {
+    Serial.print(F("deserializeJson() failed: "));
+    Serial.println(error.f_str());
+    return false;
+  }
+
+  unsigned long ts = doc_ts["ts"];
+  unsigned long age = timeClient.getEpochTime() - ts;
+
+  Serial.print("ts:");
+  Serial.println(ts);
+  Serial.print("age:");
+  Serial.println(age);
+
+  if (age > max_age_sec)
+  {
+    return false;
+  }
+  else
+  {
+    return true;
+  }
+}
+
+
 void query_powerguru(int current_period_start)
 {
   if (strlen(s.powerguru_url) == 0)
     return;
-  // Stream& input;
-  // TODO: save to a file and use filter with the cached json
-
-  // StaticJsonDocument<400> doc;
-  String url_to_call = String(s.powerguru_url) + "&states=";
-
-  for (int i = 0; i < CHANNELS; i++)
-    for (int j = 0; j < CHANNEL_STATES_MAX; j++)
-    {
-      {
-        if (s.ch[i].upstates_ch[j] == 0)
-        {
-          break;
-        }
-        url_to_call += String(s.ch[i].upstates_ch[j]) + ",";
-      }
-    }
-  url_to_call.replace(" ", "");
   Serial.print(F("current_period_start:"));
   Serial.println(current_period_start);
+
   StaticJsonDocument<16> filter;
   char start_str[11];
   itoa(current_period_start, start_str, CHANNEL_STATES_MAX);
   filter[(const char *)start_str] = true;
 
-  StaticJsonDocument<100> doc;
+  StaticJsonDocument<200> doc;
+  DeserializationError error;
 
-  Serial.println(httpGETRequest(url_to_call.c_str()));
+  if (is_cache_file_valid(pg_state_cache_filename, 10000))
+  {
+    Serial.println(F("Using cached data"));
+    File cache_file = LittleFS.open(pg_state_cache_filename, "r");
+    error = deserializeJson(doc, cache_file, DeserializationOption::Filter(filter));
+    cache_file.close();
+  }
+  else
+  {
+    Serial.println(F("Cache not valid. Querying..."));
+    // Stream& input;
+    // TODO: save to a file and use filter with the cached json
 
-  DeserializationError error = deserializeJson(doc, httpGETRequest(url_to_call.c_str()), DeserializationOption::Filter(filter));
+    // StaticJsonDocument<400> doc;
+    String url_to_call = String(s.powerguru_url) + "&states=";
+
+    for (int i = 0; i < CHANNELS; i++)
+      for (int j = 0; j < CHANNEL_STATES_MAX; j++)
+      {
+        {
+          if (s.ch[i].upstates_ch[j] == 0)
+          {
+            break;
+          }
+          url_to_call += String(s.ch[i].upstates_ch[j]) + ",";
+        }
+      }
+    url_to_call.replace(" ", "");
+    error = deserializeJson(doc, httpGETRequest(url_to_call.c_str(), pg_state_cache_filename), DeserializationOption::Filter(filter));
+  }
 
   if (error)
   {
@@ -438,15 +520,15 @@ const char setup_form_html[] PROGMEM = R"===(<html>
 
 String setup_form_processor(const String &var)
 {
-  
+
   if (var == "sta_mode")
-    return s.sta_mode?"checked":"";
+    return s.sta_mode ? "checked" : "";
   if (var == "wifi_ssid")
     return s.wifi_ssid;
   if (var == "wifi_password")
     return s.wifi_password;
   if (var == "http_username")
-    //return s.http_username;
+    // return s.http_username;
     return String("powerguru");
   if (var == "http_password")
     return s.http_password;
@@ -508,11 +590,10 @@ String setup_form_processor(const String &var)
     {
       return String(s.ch[i].is_up ? "up" : "down");
     }
-     if (var.equals(String("du_ch") + i))
+    if (var.equals(String("du_ch") + i))
     {
-      return s.ch[i].default_up?"checked":"";
+      return s.ch[i].default_up ? "checked" : "";
     }
-    
   }
   return String();
 }
@@ -543,8 +624,8 @@ void set_relays()
         {
           any_state_active = true;
 
-          Serial.print(" ,state matches:");
-          Serial.println(s.ch[i].upstates_ch[j]);
+          //Serial.print(" ,state matches:");
+          //Serial.println(s.ch[i].upstates_ch[j]);
           //      goto states_clear;
           break;
         }
@@ -584,6 +665,14 @@ void setup()
 #ifdef SENSOR_DS18B20
   sensors.begin();
 #endif
+#ifdef QUERY_POWERGURU
+  while (!LittleFS.begin())
+  {
+    Serial.println(F("Failed to initialize LittleFS library"));
+    delay(1000);
+  }
+  Serial.println(F("LittleFS initialized"));
+#endif
   Serial.println(F("setup() starting"));
 
   EEPROM.begin(sizeof(s));
@@ -595,12 +684,12 @@ void setup()
     // D2-GPIO 4, 1 wire
     strcpy(s.http_username, "powerguru");
     strcpy(s.http_password, "powerguru");
-    
+
 #ifdef QUERY_POWERGURU
-    strcpy(s.powerguru_url, "http://192.168.66.8:8080/state_series?price_area=FI");
+    // strcpy(s.powerguru_url, "http://192.168.66.8:8080/state_series?price_area=FI");
 #endif
 #ifdef METER_SHELLY3EM
-    strcpy(s.shelly_url, "http://192.168.66.40/status");
+    // strcpy(s.shelly_url, "http://192.168.66.40/status");
 #endif
 
     s.ch[0] = {{10101}, 20, 80, false, false, 14U}; // D5=GPIO14 , D1	GPIO5
@@ -615,18 +704,18 @@ void setup()
     pinMode(s.ch[i].gpio, OUTPUT);
     digitalWrite(s.ch[i].gpio, (s.ch[i].is_up ? HIGH : LOW));
   }
-/*
-  if (1 == 2) //Softap should be created if cannot connect to wifi (like in init), redirect
-  { // check also https://github.com/me-no-dev/ESPAsyncWebServer/blob/master/examples/CaptivePortal/CaptivePortal.ino
-    if (WiFi.softAP("powerguru-lite", "powerguru", 1, false, 1) == true)
-    {
-      Serial.println(F("WiFi AP created!"));
-    }
-  }*/
+  /*
+    if (1 == 2) //Softap should be created if cannot connect to wifi (like in init), redirect
+    { // check also https://github.com/me-no-dev/ESPAsyncWebServer/blob/master/examples/CaptivePortal/CaptivePortal.ino
+      if (WiFi.softAP("powerguru-lite", "powerguru", 1, false, 1) == true)
+      {
+        Serial.println(F("WiFi AP created!"));
+      }
+    }*/
   bool create_ap = !s.sta_mode;
-  
 
-  if (s.sta_mode){
+  if (s.sta_mode)
+  {
     WiFi.mode(WIFI_STA);
     WiFi.begin(s.wifi_ssid, s.wifi_password);
     if (WiFi.waitForConnectResult() != WL_CONNECTED)
@@ -634,7 +723,8 @@ void setup()
       Serial.println(F("WiFi Failed!"));
       create_ap = true; // try to create AP instead
     }
-    else {
+    else
+    {
       Serial.print(F("IP Address: "));
       Serial.println(WiFi.localIP());
       WiFi.setAutoReconnect(true);
@@ -642,32 +732,29 @@ void setup()
     }
   }
 
-  if (create_ap) //Softap should be created if so defined, cannot connect to wifi , redirect
-  { // check also https://github.com/me-no-dev/ESPAsyncWebServer/blob/master/examples/CaptivePortal/CaptivePortal.ino
+  if (create_ap) // Softap should be created if so defined, cannot connect to wifi , redirect
+  {              // check also https://github.com/me-no-dev/ESPAsyncWebServer/blob/master/examples/CaptivePortal/CaptivePortal.ino
     String mac = WiFi.macAddress();
-    for (int i = 14; i > 0;i-=3) {
-      mac.remove(i,1);
+    for (int i = 14; i > 0; i -= 3)
+    {
+      mac.remove(i, 1);
     }
     String APSSID = String("powerguru-") + mac;
-    
+
     if (WiFi.softAP(APSSID.c_str(), "powerguru", (int)random(1, 14), false, 1) == true)
     {
       Serial.println(F("WiFi AP created with ip"));
       Serial.println(WiFi.softAPIP().toString());
       // dnsServer.start(53, "*", WiFi.softAPIP());
 
-      //server.on(new CaptiveRequestHandler()).setFilter(ON_AP_FILTER,)
+      // server.on(new CaptiveRequestHandler()).setFilter(ON_AP_FILTER,)
     }
-    else {
+    else
+    {
       delay(5000); // cannot create AP, restart
       ESP.restart();
     }
   }
-
-
-
-
-
 
 #ifdef NTP_TIME
   timeClient.begin();
@@ -676,26 +763,25 @@ void setup()
   Serial.println(timeClient.getFormattedTime());
   Serial.println(timeClient.getEpochTime());
 #endif
-  server.on("/reset", HTTP_GET, [](AsyncWebServerRequest *request){ 
-    Serial.println("Resetting");
-    request->send(200, "text/plain", "Resetting... Reload after a few seconds.");
-    delay(1000);
-    // write a char(255) / hex(FF) from startByte until endByte into the EEPROM
+  server.on("/reset", HTTP_GET, [](AsyncWebServerRequest *request)
+            {
+              Serial.println("Resetting");
+              request->send(200, "text/plain", "Resetting... Reload after a few seconds.");
+              delay(1000);
+              // write a char(255) / hex(FF) from startByte until endByte into the EEPROM
 
-    for (unsigned int i = eepromaddr; i < eepromaddr + sizeof(s); ++i)
-    {
-      EEPROM.write(i, 0);
-    }
-    EEPROM.commit();
-    strcpy(s.http_username, "");
-    s.sta_mode = false;
-    s.ch[0].gpio = 255; // not the best way
+              for (unsigned int i = eepromaddr; i < eepromaddr + sizeof(s); ++i)
+              {
+                EEPROM.write(i, 0);
+              }
+              EEPROM.commit();
+              strcpy(s.http_username, "");
+              s.sta_mode = false;
+              s.ch[0].gpio = 255; // not the best way
 
-    writeToEEPROM();
-    delay(1000); 
-    ESP.restart();
-    
-    });
+              writeToEEPROM();
+              delay(1000);
+              ESP.restart(); });
 
 #ifdef METER_SHELLY3EM
   server.on("/status", HTTP_GET, [](AsyncWebServerRequest *request)
@@ -705,26 +791,26 @@ void setup()
       }
     StaticJsonDocument<150> doc; //oli 128, lisätty heapille vähän
     String output;
-    float net_energyin_period = (energyin - energyout - energyin_prev + energyout_prev);
-    float net_power_period;
+    float netEnergyInPeriod = (energyin - energyout - energyin_prev + energyout_prev);
+    float netPowerInPeriod;
     if ((now_ts - last_period_last_ts) != 0)
     {
-      net_power_period = round(net_energyin_period*3600.0 / ((now_ts - last_period_last_ts) ));
+      netPowerInPeriod = round(netEnergyInPeriod*3600.0 / ((now_ts - last_period_last_ts) ));
       
     }
     else
     {
-      net_power_period = 0;
+      netPowerInPeriod = 0;
     }
 
     JsonObject variables = doc.createNestedObject("variables");
-    variables["net_energyin_period"] = net_energyin_period;
-    variables["net_power_period"] = net_power_period;
+    variables["netEnergyInPeriod"] = netEnergyInPeriod;
+    variables["netPowerInPeriod"] = netPowerInPeriod;
     variables["updated"] = now_ts;
     variables["freeHeap"] = ESP.getFreeHeap();
 
     
-    //doc["states"][0] = variables["net_energyin_period"]>0 ? "1001":"1002";
+    //doc["states"][0] = variables["netEnergyInPeriod"]>0 ? "1001":"1002";
 
       for (int i = 0; i < CHANNEL_STATES_MAX; i++)
   {
@@ -819,13 +905,13 @@ void setup()
     */
 
               request->redirect("/");
-              // request->send(200, "text/plain", "Hello, POST: " + message);
-            });
+              /* request->send(200, "text/plain", "Hello, POST: " + message);*/
+               });
 
- /* if (create_ap) {
-    server.addHandler(new CaptiveRequestHandler()).setFilter(ON_AP_FILTER);//only when requested from AP
-  }
-  */
+  /* if (create_ap) {
+     server.addHandler(new CaptiveRequestHandler()).setFilter(ON_AP_FILTER);//only when requested from AP
+   }
+   */
 
   server.onNotFound(notFound);
 
@@ -849,11 +935,12 @@ void setup()
 
   }
   */
+  
 }
 
 void loop()
 {
-  //Serial.print(F("Starting loop"));
+  // Serial.print(F("Starting loop"));
   /*if (!s.sta_mode) {
     dnsServer.processNextRequest();
   }*/
@@ -869,7 +956,7 @@ void loop()
 #ifdef SENSOR_DS18B20
   if ((millis() - ds18B20_last) > ds18B20_interval_s * 1000)
   {
-    Serial.print(F("Calling read_sensor_ds18B20"));
+    Serial.println(F("Calling read_sensor_ds18B20"));
     read_sensor_ds18B20();
     ds18B20_last = millis();
   }
@@ -878,7 +965,7 @@ void loop()
 #ifdef METER_SHELLY3EM
   if ((millis() - shelly3em_last) > shelly3em_interval_s * 1000)
   {
-    Serial.print(F("Calling read_meter_shelly3em"));
+    Serial.println(F("Calling read_meter_shelly3em"));
     read_meter_shelly3em();
     shelly3em_last = millis();
   }
@@ -887,7 +974,7 @@ void loop()
 #ifdef QUERY_POWERGURU
   if ((millis() - powerguru_last) > powerguru_interval_s * 1000)
   {
-    Serial.print(F("Calling query_powerguru"));
+    Serial.println(F("Calling query_powerguru"));
     query_powerguru(current_period_start);
     powerguru_last = millis();
   }
