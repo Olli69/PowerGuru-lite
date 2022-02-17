@@ -18,21 +18,23 @@
 #define METER_SHELLY3EM
 #define SENSOR_DS18B20
 #define INVERTER_FRONIUS_SOLARAPI
-#define NTP_TIME_ // REMOVE amnd replace with tim.h
 
 #define RTCMEMORYSTART 65
 #define eepromaddr 0
 
 #include <ESPAsyncWebServer.h>
+/* TODO: and caveats
+-error log, file which can be forwarded?
+- different error cases, no connection e.g.
+- millis exceed long ... - problem???
+- backup for no ntp (rtcmem?), eg. boot or short break
+- channel up/down could be also stored to rtc, only 1 bit needed...
 
-// NTP time sync, poista vanha kun uusi todettu toimivaksi
-#ifdef NTP_TIME
-#include <NTPClient.h>
-#include <WiFiUdp.h>
-WiFiUDP ntpUDP;
-// check optional https://randomnerdtutorials.com/esp32-ntp-timezones-daylight-saving/
-NTPClient timeClient(ntpUDP, "europe.pool.ntp.org");
-#endif
+
+
+*/
+
+
 
 // https://werner.rothschopf.net/202011_arduino_esp8266_ntp_en.htm
 #include <time.h>
@@ -42,6 +44,7 @@ tm tm;
 #define MY_NTP_SERVER "europe.pool.ntp.org"
 // for timezone https://github.com/nayarsystems/posix_tz_db/blob/master/zones.csv
 //#define MY_TZ "CET-1CEST,M3.5.0/02,M10.5.0/03"
+//TODO: parametriksi jotenkin
 #define MY_TZ "EET-2EEST,M3.5.0/3,M10.5.0/4"
 
 // DNSServer dnsServer;
@@ -66,8 +69,7 @@ const int oneWireBus = 4; // oli 4 MiniD2, D3 GPI0 has internal up up 10kR
 OneWire oneWire(oneWireBus);
 // Pass our oneWire reference to Dallas Temperature sensor
 DallasTemperature sensors(&oneWire);
-// unsigned ds18B20_interval_s = 30;
-// unsigned long ds18B20_last = -ds18B20_interval_s * 1000;
+
 float ds18B20_temp_c;
 #endif
 
@@ -137,6 +139,7 @@ typedef struct
 #endif
 #ifdef INVERTER_FRONIUS_SOLARAPI
   char fronius_address[MAX_URL_STR_LENGTH];
+  uint32_t base_load_W;  //production above base load is "free" to use/store
 #endif
 } settings_struct;
 
@@ -268,10 +271,11 @@ String httpGETRequest(const char *url, const char *cache_file_name)
   {
     Serial.print("Error code: ");
     Serial.println(httpResponseCode);
+    http.end();
+    return String("");
   }
   // Free resources
   http.end();
-
   return payload;
 }
 
@@ -353,14 +357,17 @@ void read_meter_shelly3em()
 #endif
 
 #ifdef INVERTER_FRONIUS_SOLARAPI
-long inverter_total_period_init = 0;
+
+long unsigned int inverter_total_period_init = 0;
+long unsigned int energy_produced_period = 0;
+long unsigned int power_produced_period_avg = 0;
+
 void read_inverter_fronius()
 {
   if (strlen(s.fronius_address) == 0)
     return;
 
   time(&now);
-
   StaticJsonDocument<64> filter;
 
   JsonObject filter_Body_Data = filter["Body"].createNestedObject("Data");
@@ -377,6 +384,8 @@ void read_inverter_fronius()
   {
     Serial.print(F("deserializeJson() failed: "));
     Serial.println(error.f_str());
+    energy_produced_period = 0;
+    power_produced_period_avg = 0;
     return;
   }
 
@@ -384,11 +393,6 @@ void read_inverter_fronius()
   long int current_power = 0;
   for (JsonPair Body_Data_item : doc["Body"]["Data"].as<JsonObject>())
   {
-    /* const char* Body_Data_item_key = Body_Data_item.key().c_str(); // "PAC", "TOTAL_ENERGY"
-
-     const char* Body_Data_item_value_Unit = Body_Data_item.value()["Unit"]; // "W", "Wh"
-     long Body_Data_item_value_Value = Body_Data_item.value()["Value"]; // 368, 59621500
-     */
 
     if (Body_Data_item.key() == "PAC")
     {
@@ -409,9 +413,7 @@ void read_inverter_fronius()
     }
   }
 
-  long int energy_produced_period = total_energy - inverter_total_period_init;
-
-  // //BOOTIN JÄLKEEN PITÄISI laskea aloitusajasta
+  energy_produced_period = total_energy - inverter_total_period_init;
 
   long int time_since_recording_period_start = now - recording_period_start;
 
@@ -419,65 +421,17 @@ void read_inverter_fronius()
   Serial.println(now);
   Serial.print("recording_period_start:");
   Serial.println(recording_period_start);
-  
 
-  long int period_power_avg;
-  if (time_since_recording_period_start != 0)
-    period_power_avg = energy_produced_period * 3600 / time_since_recording_period_start;
+  if (time_since_recording_period_start < 60) // 60 is just estimate
+    power_produced_period_avg = energy_produced_period * 3600 / time_since_recording_period_start;
   else
-    period_power_avg = current_power;
+    power_produced_period_avg = current_power;
 
-  Serial.printf("energy_produced_period: %ld , time_since_recording_period_start: %ld , period_power_avg: %ld \n", energy_produced_period, time_since_recording_period_start, period_power_avg);
-
-  /*
-    now_ts = doc["unixtime"];
-    unsigned now_period = int(now_ts / (netting_period_min * 60));
-
-    if (last_period != now_period and last_period > 0)
-    { // new period
-      Serial.println(F("Shelly - new period"));
-      last_period = now_period; // riittäiskö ..._ts muutt
-      // from previous call
-      last_period_last_ts = now_ts;
-      energyin_prev = energyin;
-      energyout_prev = energyout;
-    }
-
-    float power_tot = 0;
-    Serial.println("  ");
-    int idx = 0;
-    float power[3];
-    energyin = 0;
-    energyout = 0;
-    for (JsonObject emeter : doc["emeters"].as<JsonArray>())
-    {
-      power[idx] = (float)emeter["power"];
-      power_tot += power[idx];
-      // float current = emeter["current"];
-      //  is_valid = emeter["is_valid"];
-      if (emeter["is_valid"])
-      {
-        energyin += (float)emeter["total"];
-        energyout += (float)emeter["total_returned"];
-      }
-      idx++;
-    }
-    // first query since boot
-    if (last_period == 0)
-    {
-      last_period = now_period - 1;
-      last_period_last_ts = now_ts - shelly3em_interval_s; // estimate
-      energyin_prev = energyin;
-      energyout_prev = energyout;
-    }
-
-    */
+  Serial.printf("energy_produced_period: %ld , time_since_recording_period_start: %ld , power_produced_period_avg: %ld \n", energy_produced_period, time_since_recording_period_start, power_produced_period_avg);
 }
-
 #endif
 
 #ifdef QUERY_POWERGURU
-
 bool is_cache_file_valid(const char *cache_file_name, unsigned long max_age_sec)
 {
   if (!LittleFS.exists(cache_file_name))
@@ -609,6 +563,12 @@ void refresh_powerguru(unsigned long current_period_start)
   active_states[idx++] = (energyin - energyout - energyin_prev + energyout_prev) > 0 ? 1001 : 1002;
 #endif
 
+#ifdef INVERTER_FRONIUS_SOLARAPI
+  if (power_produced_period_avg>s.base_load_W) //"extra" energy produced, more than estimated base load
+  active_states[idx++] =  1003; 
+#endif
+
+
   // for (unsigned int i = idx; i < state_list.size(); i++)
   for (unsigned int i = 0; i < state_list.size(); i++)
   {
@@ -650,8 +610,10 @@ const char setup_form_html[] PROGMEM = R"===(<html>
       input {font-size:2em;}
       input[type=checkbox] {width:50px;}
       input[type=submit] {margin-top:30px;}
-      .fld, #fldh{margin-top: 10px;}
-      .fldh {float:left; width:45%%;margin-right:3%%; }
+      .fld {margin-top: 10px;clear:both;}
+      .fldh { width:45%%;margin-right:3%%; }
+      .fldshort {float:left; width:20%%;margin-right:3%%; }
+      .fldlong {float:left; width:70%%;margin-right:3%%; }
     </style>
 </head><body>
 <form method="post">
@@ -665,11 +627,13 @@ const char setup_form_html[] PROGMEM = R"===(<html>
 
 <div class="fld"><div>Access password</div><div><input name="http_password" type="text" value="%http_password%"></div></div>
 <div class="fld"><div>Shelly energy meter url</div><div><input name="shelly_url" type="text" value="%shelly_url%"></div></div>
-<div class="fld"><div>Fronius address</div><div><input name="fronius_address" type="text" value="%fronius_address%"></div></div>
+<div class="fldlong"><div>Fronius address</div><div><input name="fronius_address" type="text" value="%fronius_address%"></div></div>
+<div class="fldshort">Base load (W): <input name="base_load_W" type="text" value="%base_load_W%"></div>
 
 
-<div class="fld"><div>Powerguru server url</div><div><input name="pg_url" type="text" value="%pg_url%"></div></div>
-<div class="fldh">Max cache age (s): <input name="pg_cache_age" type="text" value="%pg_cache_age%"></div>
+
+<div class="fldlong"><div>Powerguru server url</div><div><input name="pg_url" type="text" value="%pg_url%"></div></div>
+<div class="fldshort">Max cache age (s): <input name="pg_cache_age" type="text" value="%pg_cache_age%"></div>
 
 
 
@@ -678,24 +642,25 @@ const char setup_form_html[] PROGMEM = R"===(<html>
 <div class="fld"><div>Current sensor value: %sensorv0%</div></div>
 <h3>Channel 1</h3>
 <div class="fld"><div>Current status: %up_ch0%</div></div>
-<div class="fld"><div>Up on states</div><div><input name="states_ch0" type="text" value="%upstates_ch0%"></div></div>
-<div class="fld"><div>Sensor targets</div></div>
-<div class="fldh">Base: <input name="t_b_ch0" type="text" value="%t_b_ch0%"></div>
-<div class="fldh">Upper: <input name="t_u_ch0" type="text" value="%t_u_ch0%"></div>
+<div class="fldlong"><div>Up on states</div><div><input name="states_ch0" type="text" value="%upstates_ch0%"></div></div>
+<div class="fldshort">Target: <input name="t_u_ch0" type="text" value="%t_u_ch0%"></div>
 
-<div><div class="fld">Channel options</div><div class="fldh"><input type="checkbox"  name="du_ch0" value="du_ch0" %du_ch0%><label for="du_ch0"> default up</label></div>
-<div class="fldh">gpio: <input name="gpio_ch0" type="text" value="%gpio_ch0%"></div>
+<div class="fld">Channel options
+<div class="fldshort">Base target: <input name="t_b_ch0" type="text" value="%t_b_ch0%"></div>
+<div class="fldshort"><input type="checkbox"  name="du_ch0" value="du_ch0" %du_ch0%><label for="du_ch0"> default up</label></div>
+<div class="fldshort">gpio: <input name="gpio_ch0" type="text" value="%gpio_ch0%"></div>
 </div>
-
 
 <h3>Channel 2</h3>
 <div class="fld"><div>Current status: %up_ch1%</div></div>
-<div class="fld"><div>Up on states</div><div><input name="states_ch1" type="text" value="%upstates_ch1%"></div></div>
-<div class="fld"><div>Sensor targets</div></div>
-<div class="fldh">Base: <input name="t_b_ch1" type="text" value="%t_b_ch1%"></div>
-<div class="fldh">Upper: <input name="t_u_ch1" type="text" value="%t_u_ch1%"></div>
-<div><div class="fld">Channel options</div><div class="fldh"><input type="checkbox"  name="du_ch1" value="du_ch1" %du_ch1% ><label for="du_ch1"> default up</label></div>
-<div class="fldh">gpio: <input name="gpio_ch1" type="text" value="%gpio_ch1%"></div>
+<div class="fldlong"><div>Up on states</div><div><input name="states_ch1" type="text" value="%upstates_ch1%"></div></div>
+<div class="fldshort">Target: <input name="t_u_ch1" type="text" value="%t_u_ch1%"></div>
+
+
+<div class="fld">Channel options
+<div class="fldshort">Base target: <input name="t_b_ch1" type="text" value="%t_b_ch1%"></div>
+<div class="fldshort"><input type="checkbox"  name="du_ch1" value="du_ch1" %du_ch1% ><label for="du_ch1"> default up</label></div>
+<div class="fldshort">gpio: <input name="gpio_ch1" type="text" value="%gpio_ch1%"></div>
 </div>
 
 <br><input type="submit" value="Save">  
@@ -729,11 +694,19 @@ String setup_form_processor(const String &var)
     return F("(disabled)")
 #endif
 
+  if (var == "base_load_W")
+#ifdef INVERTER_FRONIUS_SOLARAPI
+    return String(s.base_load_W);
+#else
+    return F("(disabled)")
+#endif
+
+
   if (var == "sensorv0")
 #ifdef SENSOR_DS18B20
     return String(ds18B20_temp_c);
 #else
-            return String("not in use");
+    return String("not in use");
 #endif
 
 #ifdef QUERY_POWERGURU
@@ -851,6 +824,144 @@ void set_relays()
 
   } // channel loop
 }
+// Web response functions
+void onWebRootGet(AsyncWebServerRequest *request)
+{
+  if (!request->authenticate(s.http_username, s.http_password))
+    return request->requestAuthentication();
+  String message;
+  // large char array, tested with 14k
+  request->send_P(200, "text/html", setup_form_html, setup_form_processor);
+}
+
+void onWebResetGet(AsyncWebServerRequest *request)
+{
+  Serial.println("Resetting");
+  request->send(200, "text/plain", "Resetting... Reload after a few seconds.");
+  delay(1000);
+  // write a char(255) / hex(FF) from startByte until endByte into the EEPROM
+
+  for (unsigned int i = eepromaddr; i < eepromaddr + sizeof(s); ++i)
+  {
+    EEPROM.write(i, 0);
+  }
+  EEPROM.commit();
+  strcpy(s.http_username, "");
+  s.sta_mode = false;
+  s.ch[0].gpio = 255; // not the best way
+
+  writeToEEPROM();
+  delay(1000);
+  ESP.restart();
+}
+
+void onWebRootPost(AsyncWebServerRequest *request)
+{
+  String message;
+  int paramsNr = request->params();
+  Serial.println(paramsNr);
+  // s.sta_mode = request->getParam("sta_mode", true)->value().
+
+  s.sta_mode = request->hasParam("sta_mode", true);
+  Serial.print("s.sta_mode:");
+  Serial.print(s.sta_mode);
+
+  strcpy(s.wifi_ssid, request->getParam("wifi_ssid", true)->value().c_str());
+  strcpy(s.wifi_password, request->getParam("wifi_password", true)->value().c_str());
+  strcpy(s.http_username, request->getParam("http_username", true)->value().c_str());
+  strcpy(s.http_password, request->getParam("http_password", true)->value().c_str());
+  strcpy(s.shelly_url, request->getParam("shelly_url", true)->value().c_str());
+#ifdef INVERTER_FRONIUS_SOLARAPI
+  strcpy(s.fronius_address, request->getParam("fronius_address", true)->value().c_str());
+  s.base_load_W = request->getParam("base_load_W", true)->value().toInt();
+
+#endif
+
+#ifdef QUERY_POWERGURU
+  strcpy(s.pg_url, request->getParam("pg_url", true)->value().c_str());
+  s.pg_cache_age = request->getParam("pg_cache_age", true)->value().toInt();
+#endif
+
+  if (request->hasParam("states_ch0", true))
+  {
+
+    // uint16_t upstates_ch[CHANNEL_STATES_MAX];
+    Serial.print("processing:");
+    Serial.println(request->getParam("states_ch0", true)->value().c_str());
+    str_to_uint_array(request->getParam("states_ch0", true)->value().c_str(), s.ch[0].upstates_ch);
+    Serial.print(s.ch[0].upstates_ch[0]);
+    Serial.print("...");
+    Serial.print(s.ch[0].upstates_ch[1]);
+    Serial.println();
+    s.ch[0].gpio = request->getParam("gpio_ch0", true)->value().toInt();
+    s.ch[0].default_up = request->hasParam("du_ch0", true);
+    s.ch[0].target_b_ch = request->getParam("t_b_ch0", true)->value().toFloat();
+    s.ch[0].target_u_ch = request->getParam("t_u_ch0", true)->value().toFloat();
+  }
+  if (request->hasParam("states_ch1", true))
+  {
+    str_to_uint_array(request->getParam("states_ch1", true)->value().c_str(), s.ch[1].upstates_ch);
+    s.ch[1].gpio = request->getParam("gpio_ch1", true)->value().toInt();
+    s.ch[1].default_up = request->hasParam("du_ch1", true);
+    s.ch[1].target_b_ch = request->getParam("t_b_ch1", true)->value().toFloat();
+    s.ch[1].target_u_ch = request->getParam("t_u_ch1", true)->value().toFloat();
+  }
+
+  // save to non-volatile memory
+  writeToEEPROM();
+
+  // delete cache file
+  LittleFS.remove(pg_state_cache_filename);
+  request->redirect("/");
+}
+
+void onWebStatusGet(AsyncWebServerRequest *request)
+{
+
+  if (!request->authenticate(s.http_username, s.http_password))
+  {
+    return request->requestAuthentication();
+  }
+  StaticJsonDocument<250> doc; // oli 128, lisätty heapille ja invertterille
+  String output;
+  JsonObject variables = doc.createNestedObject("variables");
+
+#ifdef METER_SHELLY3EM
+  float netEnergyInPeriod = (energyin - energyout - energyin_prev + energyout_prev);
+  float netPowerInPeriod;
+  if ((now_ts - last_period_last_ts) != 0)
+  {
+    netPowerInPeriod = round(netEnergyInPeriod * 3600.0 / ((now_ts - last_period_last_ts)));
+  }
+  else
+  {
+    netPowerInPeriod = 0;
+  }
+  variables["netEnergyInPeriod"] = netEnergyInPeriod;
+  variables["netPowerInPeriod"] = netPowerInPeriod;
+#endif
+
+#ifdef INVERTER_FRONIUS_SOLARAPI
+  variables["energyProducedPeriod"] = energy_produced_period;
+  variables["powerProducedPeriodAvg"] = power_produced_period_avg;
+#endif
+
+  variables["updated"] = now_ts;
+  variables["freeHeap"] = ESP.getFreeHeap();
+
+  // TODO: näistä puuttu nyt sisäiset, pitäisikö lisätä vai poistaa kokonaan, onko tarvetta debugille
+  for (int i = 0; i < CHANNEL_STATES_MAX; i++)
+  {
+   // doc["states"][i] = active_states[i];
+    if (active_states[i] > 0)
+      doc["states"][i] = active_states[i];
+    else
+      break;
+  }
+
+  serializeJson(doc, output);
+  request->send(200, "application/json", output);
+}
 
 void setup()
 {
@@ -897,7 +1008,10 @@ void setup()
     Serial.print(F("Setting gpio "));
     Serial.println(s.ch[i].gpio);
     pinMode(s.ch[i].gpio, OUTPUT);
-    digitalWrite(s.ch[i].gpio, (s.ch[i].is_up ? HIGH : LOW));
+    //if up/down up-to-date stored to non-volatile:
+    //digitalWrite(s.ch[i].gpio, (s.ch[i].is_up ? HIGH : LOW));
+    // use defaults
+    digitalWrite(s.ch[i].gpio, (s.ch[i].default_up? HIGH : LOW));
   }
   /*
     if (1 == 2) //Softap should be created if cannot connect to wifi (like in init), redirect
@@ -951,168 +1065,13 @@ void setup()
     }
   }
 
-#ifdef NTP_TIME
-  timeClient.begin();
-  delay(1000);
-  timeClient.update();
-  Serial.println(timeClient.getFormattedTime());
-  Serial.println(timeClient.getEpochTime());
-#endif
   // TODO: prepare for no internet connection -> channel defaults probably, RTC?
   configTime(MY_TZ, MY_NTP_SERVER); // --> Here is the IMPORTANT ONE LINER needed in your sketch!
 
-  server.on("/reset", HTTP_GET, [](AsyncWebServerRequest *request)
-            {
-              Serial.println("Resetting");
-              request->send(200, "text/plain", "Resetting... Reload after a few seconds.");
-              delay(1000);
-              // write a char(255) / hex(FF) from startByte until endByte into the EEPROM
-
-              for (unsigned int i = eepromaddr; i < eepromaddr + sizeof(s); ++i)
-              {
-                EEPROM.write(i, 0);
-              }
-              EEPROM.commit();
-              strcpy(s.http_username, "");
-              s.sta_mode = false;
-              s.ch[0].gpio = 255; // not the best way
-
-              writeToEEPROM();
-              delay(1000);
-              ESP.restart(); });
-
-#ifdef METER_SHELLY3EM
-  server.on("/status", HTTP_GET, [](AsyncWebServerRequest *request)
-            { 
-      if(!request->authenticate(s.http_username, s.http_password)) {
-      return request->requestAuthentication();
-      }
-    StaticJsonDocument<150> doc; //oli 128, lisätty heapille vähän
-    String output;
-    float netEnergyInPeriod = (energyin - energyout - energyin_prev + energyout_prev);
-    float netPowerInPeriod;
-    if ((now_ts - last_period_last_ts) != 0)
-    {
-      netPowerInPeriod = round(netEnergyInPeriod*3600.0 / ((now_ts - last_period_last_ts) ));
-      
-    }
-    else
-    {
-      netPowerInPeriod = 0;
-    }
-
-    JsonObject variables = doc.createNestedObject("variables");
-    variables["netEnergyInPeriod"] = netEnergyInPeriod;
-    variables["netPowerInPeriod"] = netPowerInPeriod;
-    variables["updated"] = now_ts;
-    variables["freeHeap"] = ESP.getFreeHeap();
-
-    
-
-      for (int i = 0; i < CHANNEL_STATES_MAX; i++)
-  {
-    doc["states"][i] = active_states[i];
-    if (active_states[i] > 0)
-      doc["states"][i] = active_states[i];
-    else
-      break;
-  }
-
-    serializeJson(doc, output);
-    request->send(200, "application/json", output); });
-#endif
-
-  // Send a GET request to <IP>/get?message=<message>
-  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request)
-            {
-              if (!request->authenticate(s.http_username, s.http_password))
-                return request->requestAuthentication();
-              String message;
-              // large char array, tested with 14k
-              request->send_P(200, "text/html", setup_form_html, setup_form_processor); });
-
-  // Send a POST request to <IP>/post with a form field message set to <message>
-  server.on("/", HTTP_POST, [](AsyncWebServerRequest *request)
-            {
-              String message;
-              int paramsNr = request->params();
-              Serial.println(paramsNr);
-             // s.sta_mode = request->getParam("sta_mode", true)->value().
-
-              s.sta_mode = request->hasParam("sta_mode", true);
-              Serial.print("s.sta_mode:");
-              Serial.print(s.sta_mode);
-          
-              strcpy(s.wifi_ssid, request->getParam("wifi_ssid", true)->value().c_str());
-              strcpy(s.wifi_password, request->getParam("wifi_password", true)->value().c_str());
-              strcpy(s.http_username, request->getParam("http_username", true)->value().c_str());
-              strcpy(s.http_password, request->getParam("http_password", true)->value().c_str());
-              strcpy(s.shelly_url, request->getParam("shelly_url", true)->value().c_str());
-#ifdef INVERTER_FRONIUS_SOLARAPI
-              strcpy(s.fronius_address, request->getParam("fronius_address", true)->value().c_str());
-#endif
-
-#ifdef QUERY_POWERGURU
-              strcpy(s.pg_url, request->getParam("pg_url", true)->value().c_str());
-              s.pg_cache_age = request->getParam("pg_cache_age", true)->value().toInt();
-#endif
-                  
-              if (request->hasParam("states_ch0", true))
-              {
-                
-                // uint16_t upstates_ch[CHANNEL_STATES_MAX];
-                Serial.print("processing:");
-                Serial.println(request->getParam("states_ch0", true)->value().c_str());
-                str_to_uint_array(request->getParam("states_ch0", true)->value().c_str(), s.ch[0].upstates_ch);
-                Serial.print(s.ch[0].upstates_ch[0]);
-                Serial.print("...");
-                Serial.print(s.ch[0].upstates_ch[1]);
-                Serial.println();
-                s.ch[0].gpio = request->getParam("gpio_ch0", true)->value().toInt();
-                s.ch[0].default_up = request->hasParam("du_ch0", true);
-                s.ch[0].target_b_ch = request->getParam("t_b_ch0", true)->value().toFloat();
-                s.ch[0].target_u_ch = request->getParam("t_u_ch0", true)->value().toFloat();
-              }
-              if (request->hasParam("states_ch1", true))
-              {
-                str_to_uint_array(request->getParam("states_ch1", true)->value().c_str(), s.ch[1].upstates_ch);
-                s.ch[1].gpio = request->getParam("gpio_ch1", true)->value().toInt();
-                s.ch[1].default_up = request->hasParam("du_ch1", true);
-                s.ch[1].target_b_ch = request->getParam("t_b_ch1", true)->value().toFloat();
-                s.ch[1].target_u_ch = request->getParam("t_u_ch1", true)->value().toFloat();
-              }
-
-
-              // save to non-volatile memory
-              writeToEEPROM();
-
-              // AsyncWebParameter* paramUN = request->getParam("USERNAME",true);
-
-              /*
-              for (int i = 0; i < paramsNr; i++)
-              {
-                AsyncWebParameter *p = request->getParam(i);
-
-                Serial.print("Param name: ");
-                Serial.println(p->name());
-
-                Serial.print("Param value: ");
-                Serial.println(p->value());
-
-                Serial.println("------");
-              } */
-              /*
-              if (request->hasParam(PARAM_MESSAGE, true)) {
-                  message = request->getParam(PARAM_MESSAGE, true)->value();
-              } else {
-                  message = "No message sent";
-              }
-    */
-
-              // delete cache file
-              LittleFS.remove(pg_state_cache_filename);
-              request->redirect("/");
-              /* request->send(200, "text/plain", "Hello, POST: " + message);*/ });
+  server.on("/reset", HTTP_GET, onWebResetGet);
+  server.on("/status", HTTP_GET, onWebStatusGet);
+  server.on("/", HTTP_GET, onWebRootGet);
+  server.on("/", HTTP_POST, onWebRootPost);
 
   /* if (create_ap) {
      server.addHandler(new CaptiveRequestHandler()).setFilter(ON_AP_FILTER);//only when requested from AP
@@ -1126,45 +1085,28 @@ void setup()
   Serial.print(F("setup() finished:"));
   Serial.println(ESP.getFreeHeap());
 
-  // String upstates_ch[CHANNELS] = {"10101,10120, 11022", "10102,10104,11022,12110,11141"};
-  // float target_ch[CHANNELS] = {25, 99};
-
-  // uint16_t ups_ch[CHANNEL_STATES_MAX];
-  /*
-  uint16_t* ups_ch = new uint16_t[CHANNEL_STATES_MAX];
-  Serial.println("alku");
-  String_to_uint_array(String("10101,10120, 11022"), ups_ch);
-  Serial.println("jatkuu");
-  for (int i = 0; i < CHANNEL_STATES_MAX;i++){
-    Serial.print(i);Serial.print(": ");
-    Serial.println(ups_ch[i]);
-
-  }
-  */
-
 #ifdef QUERY_POWERGURU
-  powerguru_last_refresh = -powerguru_interval_s * 1000; //
-                                                         // strcpy(s.pg_url, "http://192.168.66.8:8080/state_series?price_area=FI");
+  powerguru_last_refresh = -powerguru_interval_s * 1000;
+  // strcpy(s.pg_url, "http://192.168.66.8:8080/state_series?price_area=FI");
 #endif
 
   // first period is not full, so start calculations from now
 
-  int 
- do
+  // TODO: if not ntp server: could we get old ts from eeprom (rtcmem has more cycles), or how about using date from  powerguru/shelly query (if used)
+  //  ehkä tästä saisi jotain, vaikkei olekaan viimeisen päälle, rtcmem olisi paras paikka kun ei kulum kai, https://stackoverflow.com/questions/54458116/how-can-i-set-the-esp32s-clock-without-access-to-the-internet
+  do
   {
     time(&started);
     delay(500);
     Serial.print("*");
-  }while(started < 1645106860);
+  } while (started < 1645106860);
 
+  // Serial.println(&timeinfo, "TIMEINFO %A, %B %d %Y %H:%M:%S");
 
- // Serial.println(&timeinfo, "TIMEINFO %A, %B %d %Y %H:%M:%S");
-
- 
   Serial.print("started:");
   Serial.println(started);
 
-} //end of setup()
+} // end of setup()
 
 long get_period_start_time(long ts)
 {
@@ -1194,25 +1136,6 @@ void loop()
     delay(5000);
     return;
   }
-  /*
-  #ifdef SENSOR_DS18B20
-    if ((millis() - ds18B20_last) > ds18B20_interval_s * 1000)
-    {
-      Serial.print(F(" ds18B20 "));
-      read_sensor_ds18B20();
-      ds18B20_last = millis();
-    }
-  #endif
-
-  #ifdef METER_SHELLY3EM
-    if ((millis() - shelly3em_last) > shelly3em_interval_s * 1000)
-    {
-      Serial.print(F(" shelly3em "));
-      read_meter_shelly3em();
-      shelly3em_last = millis();
-    }
-  #endif
-  */
 
   // TODO: all sensor /meter reads could be here?, do we need diffrent frequencies?
   if (((millis() - sensor_last_refresh) > sensor_read_interval_s * 1000) or period_changed)
