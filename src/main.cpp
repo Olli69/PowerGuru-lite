@@ -1,6 +1,3 @@
-
-// https://registry.platformio.org/libraries/me-no-dev/ESP%20Async%20WebServer/installation
-
 #include <Arduino.h>
 #include <math.h> //round
 #include <EEPROM.h>
@@ -20,20 +17,32 @@
 #define QUERY_POWERGURU
 #define METER_SHELLY3EM
 #define SENSOR_DS18B20
-#define NTP_TIME
+#define INVERTER_FRONIUS_SOLARAPI
+#define NTP_TIME_ // REMOVE amnd replace with tim.h
 
 #define RTCMEMORYSTART 65
 #define eepromaddr 0
 
 #include <ESPAsyncWebServer.h>
 
-// NTP time sync
+// NTP time sync, poista vanha kun uusi todettu toimivaksi
 #ifdef NTP_TIME
 #include <NTPClient.h>
 #include <WiFiUdp.h>
 WiFiUDP ntpUDP;
+// check optional https://randomnerdtutorials.com/esp32-ntp-timezones-daylight-saving/
 NTPClient timeClient(ntpUDP, "europe.pool.ntp.org");
 #endif
+
+// https://werner.rothschopf.net/202011_arduino_esp8266_ntp_en.htm
+#include <time.h>
+time_t now; // this is the epoch
+tm tm;
+
+#define MY_NTP_SERVER "europe.pool.ntp.org"
+// for timezone https://github.com/nayarsystems/posix_tz_db/blob/master/zones.csv
+//#define MY_TZ "CET-1CEST,M3.5.0/02,M10.5.0/03"
+#define MY_TZ "EET-2EEST,M3.5.0/3,M10.5.0/4"
 
 // DNSServer dnsServer;
 AsyncWebServer server(80);
@@ -57,17 +66,17 @@ const int oneWireBus = 4; // oli 4 MiniD2, D3 GPI0 has internal up up 10kR
 OneWire oneWire(oneWireBus);
 // Pass our oneWire reference to Dallas Temperature sensor
 DallasTemperature sensors(&oneWire);
-unsigned ds18B20_interval_s = 30;
-unsigned long ds18B20_last = -ds18B20_interval_s * 1000;
+// unsigned ds18B20_interval_s = 30;
+// unsigned long ds18B20_last = -ds18B20_interval_s * 1000;
 float ds18B20_temp_c;
 #endif
 
 #ifdef QUERY_POWERGURU
-// char powerguru_url[] = "http://192.168.66.8:8080/state_series?price_area=FI";
+// char pg_url[] = "http://192.168.66.8:8080/state_series?price_area=FI";
 const char *pg_state_cache_filename = "/pg_state_cache.json";
 
-unsigned powerguru_interval_s = 3600;
-unsigned long powerguru_last = -powerguru_interval_s * 1000; //
+unsigned powerguru_interval_s = 30;
+unsigned long powerguru_last_refresh = -powerguru_interval_s * 1000; //
 #endif
 
 #ifdef METER_SHELLY3EM
@@ -76,14 +85,22 @@ unsigned shelly3em_interval_s = 30;
 unsigned long shelly3em_last = -shelly3em_interval_s * 1000;
 #endif
 
+// all read operations at once
+unsigned sensor_read_interval_s = 30;
+unsigned long sensor_last_refresh = -sensor_read_interval_s * 1000; // start reading as soon as you get to first loop
+
 //  the following variables are unsigned longs because the time, measured in
 //  milliseconds, will quickly become a bigger number than can be stored in an int.
 // Timer set to 10 minutes (600000)
 // unsigned long timerDelay = 600000;
 // Set timer to 5 seconds (5000)
 
-const int netting_period_min = 60; // should be 60
-int current_period_start = 0;
+const unsigned long netting_period_min = 60; // should be 60
+unsigned long recording_period_start = 0;    // first period: boot time, later period starts
+unsigned long current_period_start = 0;
+unsigned long previous_period_start = 0;
+time_t started = 0;
+bool period_changed = false;
 
 #define CHANNELS 2
 #define CHANNEL_STATES_MAX 10
@@ -111,10 +128,15 @@ typedef struct
   char http_password[MAX_ID_STR_LENGTH];
   channel_struct ch[CHANNELS];
 #ifdef QUERY_POWERGURU
-  char powerguru_url[MAX_URL_STR_LENGTH];
+  char pg_url[MAX_URL_STR_LENGTH];
+  uint16_t pg_cache_age;
+  // uint16_t pg_refresh_interval;
 #endif
 #ifdef METER_SHELLY3EM
   char shelly_url[MAX_URL_STR_LENGTH];
+#endif
+#ifdef INVERTER_FRONIUS_SOLARAPI
+  char fronius_address[MAX_URL_STR_LENGTH];
 #endif
 } settings_struct;
 
@@ -206,9 +228,9 @@ String httpGETRequest(const char *url, const char *cache_file_name)
   // Your IP address with path or Domain name with URL path
   http.begin(client, url);
 
-  Serial.println(url);
-  Serial.println(cache_file_name);
-  // Send HTTP POST request
+  // Serial.println(url);
+  // Serial.println(cache_file_name);
+  //  Send HTTP POST request
   int httpResponseCode = http.GET();
 
   String payload = "{}";
@@ -274,7 +296,7 @@ void read_meter_shelly3em()
 {
   if (strlen(s.shelly_url) == 0)
     return;
-  Serial.print(F("Starting to read Shelly"));
+  // Serial.print(F("Starting to read Shelly"));
   DynamicJsonDocument doc(2048); // oli 1536
 
   // sensorReadings = ;
@@ -292,7 +314,7 @@ void read_meter_shelly3em()
 
   if (last_period != now_period and last_period > 0)
   { // new period
-    Serial.println(F("VAIHTO"));
+    Serial.println(F("Shelly - new period"));
     last_period = now_period; // riittäiskö ..._ts muutt
     // from previous call
     last_period_last_ts = now_ts;
@@ -330,18 +352,148 @@ void read_meter_shelly3em()
 }
 #endif
 
+#ifdef INVERTER_FRONIUS_SOLARAPI
+long inverter_total_period_init = 0;
+void read_inverter_fronius()
+{
+  if (strlen(s.fronius_address) == 0)
+    return;
+
+  time(&now);
+
+  StaticJsonDocument<64> filter;
+
+  JsonObject filter_Body_Data = filter["Body"].createNestedObject("Data");
+  filter_Body_Data["TOTAL_ENERGY"] = true;
+  filter_Body_Data["PAC"] = true;
+
+  StaticJsonDocument<256> doc;
+  String inverter_url = String(s.fronius_address) + "/solar_api/v1/GetInverterRealtimeData.cgi?scope=Device&DeviceId=1&DataCollection=CumulationInverterData";
+  Serial.println(inverter_url);
+
+  DeserializationError error = deserializeJson(doc, httpGETRequest(inverter_url.c_str(), ""), DeserializationOption::Filter(filter));
+
+  if (error)
+  {
+    Serial.print(F("deserializeJson() failed: "));
+    Serial.println(error.f_str());
+    return;
+  }
+
+  long int total_energy = 0;
+  long int current_power = 0;
+  for (JsonPair Body_Data_item : doc["Body"]["Data"].as<JsonObject>())
+  {
+    /* const char* Body_Data_item_key = Body_Data_item.key().c_str(); // "PAC", "TOTAL_ENERGY"
+
+     const char* Body_Data_item_value_Unit = Body_Data_item.value()["Unit"]; // "W", "Wh"
+     long Body_Data_item_value_Value = Body_Data_item.value()["Value"]; // 368, 59621500
+     */
+
+    if (Body_Data_item.key() == "PAC")
+    {
+      Serial.print("PAC:");
+      Serial.println((long)Body_Data_item.value()["Value"]);
+      current_power = Body_Data_item.value()["Value"];
+    }
+    if (Body_Data_item.key() == "TOTAL_ENERGY")
+    {
+      Serial.print("TOTAL_ENERGY:");
+      total_energy = Body_Data_item.value()["Value"];
+      if (period_changed)
+      {
+        Serial.println("PERIOD CHANGED");
+        inverter_total_period_init = total_energy;
+      }
+      Serial.println((long)Body_Data_item.value()["Value"]);
+    }
+  }
+
+  long int energy_produced_period = total_energy - inverter_total_period_init;
+
+  // //BOOTIN JÄLKEEN PITÄISI laskea aloitusajasta
+
+  long int time_since_recording_period_start = now - recording_period_start;
+
+  Serial.print("now:");
+  Serial.println(now);
+  Serial.print("recording_period_start:");
+  Serial.println(recording_period_start);
+  
+
+  long int period_power_avg;
+  if (time_since_recording_period_start != 0)
+    period_power_avg = energy_produced_period * 3600 / time_since_recording_period_start;
+  else
+    period_power_avg = current_power;
+
+  Serial.printf("energy_produced_period: %ld , time_since_recording_period_start: %ld , period_power_avg: %ld \n", energy_produced_period, time_since_recording_period_start, period_power_avg);
+
+  /*
+    now_ts = doc["unixtime"];
+    unsigned now_period = int(now_ts / (netting_period_min * 60));
+
+    if (last_period != now_period and last_period > 0)
+    { // new period
+      Serial.println(F("Shelly - new period"));
+      last_period = now_period; // riittäiskö ..._ts muutt
+      // from previous call
+      last_period_last_ts = now_ts;
+      energyin_prev = energyin;
+      energyout_prev = energyout;
+    }
+
+    float power_tot = 0;
+    Serial.println("  ");
+    int idx = 0;
+    float power[3];
+    energyin = 0;
+    energyout = 0;
+    for (JsonObject emeter : doc["emeters"].as<JsonArray>())
+    {
+      power[idx] = (float)emeter["power"];
+      power_tot += power[idx];
+      // float current = emeter["current"];
+      //  is_valid = emeter["is_valid"];
+      if (emeter["is_valid"])
+      {
+        energyin += (float)emeter["total"];
+        energyout += (float)emeter["total_returned"];
+      }
+      idx++;
+    }
+    // first query since boot
+    if (last_period == 0)
+    {
+      last_period = now_period - 1;
+      last_period_last_ts = now_ts - shelly3em_interval_s; // estimate
+      energyin_prev = energyin;
+      energyout_prev = energyout;
+    }
+
+    */
+}
+
+#endif
+
 #ifdef QUERY_POWERGURU
 
 bool is_cache_file_valid(const char *cache_file_name, unsigned long max_age_sec)
 {
-  StaticJsonDocument<16> filter;
-  filter["ts"] = true; // first get timestamp field
-
+  if (!LittleFS.exists(cache_file_name))
+  {
+    Serial.println(F("No cache file. "));
+    return false;
+  }
   File cache_file = LittleFS.open(cache_file_name, "r");
   if (!cache_file)
   { // failed to open the file, retrn empty result
+    Serial.println(F("Failed to open cache file. "));
     return false;
   }
+  StaticJsonDocument<16> filter;
+  filter["ts"] = true; // first get timestamp field
+
   StaticJsonDocument<50> doc_ts;
 
   DeserializationError error = deserializeJson(doc_ts, cache_file, DeserializationOption::Filter(filter));
@@ -355,11 +507,13 @@ bool is_cache_file_valid(const char *cache_file_name, unsigned long max_age_sec)
   }
 
   unsigned long ts = doc_ts["ts"];
-  unsigned long age = timeClient.getEpochTime() - ts;
+  time(&now);
+  // unsigned long age = timeClient.getEpochTime() - ts;
+  unsigned long age = now - ts;
 
   Serial.print("ts:");
-  Serial.println(ts);
-  Serial.print("age:");
+  Serial.print(ts);
+  Serial.print(", age:");
   Serial.println(age);
 
   if (age > max_age_sec)
@@ -372,12 +526,16 @@ bool is_cache_file_valid(const char *cache_file_name, unsigned long max_age_sec)
   }
 }
 
-
-void query_powerguru(int current_period_start)
+void refresh_powerguru(unsigned long current_period_start)
 {
-  if (strlen(s.powerguru_url) == 0)
+  if (strlen(s.pg_url) == 0)
     return;
-  Serial.print(F("current_period_start:"));
+
+  time(&now);
+  localtime_r(&now, &tm);
+  Serial.print(" refresh_powerguru ");
+  // Serial.print(timeClient.getFormattedTime());
+  Serial.print(F("  current_period_start: "));
   Serial.println(current_period_start);
 
   StaticJsonDocument<16> filter;
@@ -388,7 +546,7 @@ void query_powerguru(int current_period_start)
   StaticJsonDocument<200> doc;
   DeserializationError error;
 
-  if (is_cache_file_valid(pg_state_cache_filename, 10000))
+  if (is_cache_file_valid(pg_state_cache_filename, s.pg_cache_age))
   {
     Serial.println(F("Using cached data"));
     File cache_file = LittleFS.open(pg_state_cache_filename, "r");
@@ -402,7 +560,7 @@ void query_powerguru(int current_period_start)
     // TODO: save to a file and use filter with the cached json
 
     // StaticJsonDocument<400> doc;
-    String url_to_call = String(s.powerguru_url) + "&states=";
+    String url_to_call = String(s.pg_url) + "&states=";
 
     for (int i = 0; i < CHANNELS; i++)
       for (int j = 0; j < CHANNEL_STATES_MAX; j++)
@@ -427,18 +585,26 @@ void query_powerguru(int current_period_start)
   }
 
   JsonArray state_list = doc[start_str];
-  Serial.println("state_list info:");
-  Serial.println(start_str);
+  /*
+  Serial.print("state_list info:");
+  Serial.print(start_str);
+  Serial.print("size:");
   Serial.println(state_list.size());
 
+*/
   // clean old
   for (int i = 0; i < CHANNEL_STATES_MAX; i++)
   {
     active_states[i] = 0;
   }
-  // add internal
+  // add internally generated states, see https://github.com/Olli69/PowerGuru/blob/main/docs/states.md
   byte idx = 0;
   active_states[idx++] = 1; // always on
+                            // add locally generated states, tämön voisi laittaa omaksi metodiksi
+                            // How about local time
+  // active_states[idx++] = 100 + timeClient.getHours();
+  active_states[idx++] = 100 + tm.tm_hour;
+
 #ifdef METER_SHELLY3EM
   active_states[idx++] = (energyin - energyout - energyin_prev + energyout_prev) > 0 ? 1001 : 1002;
 #endif
@@ -448,14 +614,24 @@ void query_powerguru(int current_period_start)
   {
     // for (String state : doc["states"].as<String>()) {
     //  const char* states_0 = states[0];
-    Serial.print("state:");
-    Serial.print((const char *)state_list[i]);
-    Serial.print("#");
-    Serial.println((int)state_list[i]);
+    /* Serial.print("state:");
+     Serial.print((const char *)state_list[i]);
+     Serial.print("#");
+     Serial.println((int)state_list[i]); */
     active_states[idx++] = (uint16_t)state_list[i];
     if (idx == CHANNEL_STATES_MAX)
       break;
   }
+  // DEBUG
+  Serial.print("Active states:");
+  for (unsigned int i = 0; i < CHANNEL_STATES_MAX; i++)
+  {
+    if (active_states[i] == 0)
+      break;
+    Serial.print(active_states[i]);
+    Serial.print(",");
+  }
+  Serial.println();
 }
 #endif
 
@@ -489,7 +665,15 @@ const char setup_form_html[] PROGMEM = R"===(<html>
 
 <div class="fld"><div>Access password</div><div><input name="http_password" type="text" value="%http_password%"></div></div>
 <div class="fld"><div>Shelly energy meter url</div><div><input name="shelly_url" type="text" value="%shelly_url%"></div></div>
-<div class="fld"><div>Powerguru server url</div><div><input name="powerguru_url" type="text" value="%powerguru_url%"></div></div>
+<div class="fld"><div>Fronius address</div><div><input name="fronius_address" type="text" value="%fronius_address%"></div></div>
+
+
+<div class="fld"><div>Powerguru server url</div><div><input name="pg_url" type="text" value="%pg_url%"></div></div>
+<div class="fldh">Max cache age (s): <input name="pg_cache_age" type="text" value="%pg_cache_age%"></div>
+
+
+
+
 <h2>Channels</h2>
 <div class="fld"><div>Current sensor value: %sensorv0%</div></div>
 <h3>Channel 1</h3>
@@ -538,16 +722,26 @@ String setup_form_processor(const String &var)
     return s.shelly_url;
 #endif
 
+  if (var == "fronius_address")
+#ifdef INVERTER_FRONIUS_SOLARAPI
+    return s.fronius_address;
+#else
+    return F("(disabled)")
+#endif
+
   if (var == "sensorv0")
 #ifdef SENSOR_DS18B20
     return String(ds18B20_temp_c);
 #else
-    return String("not in use");
+            return String("not in use");
 #endif
 
 #ifdef QUERY_POWERGURU
-  if (var == "powerguru_url")
-    return s.powerguru_url;
+  if (var == "pg_url")
+    return s.pg_url;
+  if (var == "pg_cache_age")
+    return String(s.pg_cache_age);
+
 #endif
 
   // Serial.println("Channel processor");
@@ -624,9 +818,9 @@ void set_relays()
         {
           any_state_active = true;
 
-          //Serial.print(" ,state matches:");
-          //Serial.println(s.ch[i].upstates_ch[j]);
-          //      goto states_clear;
+          // Serial.print(" ,state matches:");
+          // Serial.println(s.ch[i].upstates_ch[j]);
+          //       goto states_clear;
           break;
         }
       }
@@ -666,6 +860,7 @@ void setup()
   sensors.begin();
 #endif
 #ifdef QUERY_POWERGURU
+  // TODO: pitäisikö olla jo kevyempi
   while (!LittleFS.begin())
   {
     Serial.println(F("Failed to initialize LittleFS library"));
@@ -686,7 +881,7 @@ void setup()
     strcpy(s.http_password, "powerguru");
 
 #ifdef QUERY_POWERGURU
-    // strcpy(s.powerguru_url, "http://192.168.66.8:8080/state_series?price_area=FI");
+    // strcpy(s.pg_url, "http://192.168.66.8:8080/state_series?price_area=FI");
 #endif
 #ifdef METER_SHELLY3EM
     // strcpy(s.shelly_url, "http://192.168.66.40/status");
@@ -763,6 +958,9 @@ void setup()
   Serial.println(timeClient.getFormattedTime());
   Serial.println(timeClient.getEpochTime());
 #endif
+  // TODO: prepare for no internet connection -> channel defaults probably, RTC?
+  configTime(MY_TZ, MY_NTP_SERVER); // --> Here is the IMPORTANT ONE LINER needed in your sketch!
+
   server.on("/reset", HTTP_GET, [](AsyncWebServerRequest *request)
             {
               Serial.println("Resetting");
@@ -810,7 +1008,6 @@ void setup()
     variables["freeHeap"] = ESP.getFreeHeap();
 
     
-    //doc["states"][0] = variables["netEnergyInPeriod"]>0 ? "1001":"1002";
 
       for (int i = 0; i < CHANNEL_STATES_MAX; i++)
   {
@@ -851,9 +1048,15 @@ void setup()
               strcpy(s.http_username, request->getParam("http_username", true)->value().c_str());
               strcpy(s.http_password, request->getParam("http_password", true)->value().c_str());
               strcpy(s.shelly_url, request->getParam("shelly_url", true)->value().c_str());
-              strcpy(s.powerguru_url, request->getParam("powerguru_url", true)->value().c_str());
-              
+#ifdef INVERTER_FRONIUS_SOLARAPI
+              strcpy(s.fronius_address, request->getParam("fronius_address", true)->value().c_str());
+#endif
 
+#ifdef QUERY_POWERGURU
+              strcpy(s.pg_url, request->getParam("pg_url", true)->value().c_str());
+              s.pg_cache_age = request->getParam("pg_cache_age", true)->value().toInt();
+#endif
+                  
               if (request->hasParam("states_ch0", true))
               {
                 
@@ -884,6 +1087,8 @@ void setup()
               writeToEEPROM();
 
               // AsyncWebParameter* paramUN = request->getParam("USERNAME",true);
+
+              /*
               for (int i = 0; i < paramsNr; i++)
               {
                 AsyncWebParameter *p = request->getParam(i);
@@ -895,7 +1100,7 @@ void setup()
                 Serial.println(p->value());
 
                 Serial.println("------");
-              }
+              } */
               /*
               if (request->hasParam(PARAM_MESSAGE, true)) {
                   message = request->getParam(PARAM_MESSAGE, true)->value();
@@ -904,9 +1109,10 @@ void setup()
               }
     */
 
+              // delete cache file
+              LittleFS.remove(pg_state_cache_filename);
               request->redirect("/");
-              /* request->send(200, "text/plain", "Hello, POST: " + message);*/
-               });
+              /* request->send(200, "text/plain", "Hello, POST: " + message);*/ });
 
   /* if (create_ap) {
      server.addHandler(new CaptiveRequestHandler()).setFilter(ON_AP_FILTER);//only when requested from AP
@@ -935,7 +1141,34 @@ void setup()
 
   }
   */
-  
+
+#ifdef QUERY_POWERGURU
+  powerguru_last_refresh = -powerguru_interval_s * 1000; //
+                                                         // strcpy(s.pg_url, "http://192.168.66.8:8080/state_series?price_area=FI");
+#endif
+
+  // first period is not full, so start calculations from now
+
+  int 
+ do
+  {
+    time(&started);
+    delay(500);
+    Serial.print("*");
+  }while(started < 1645106860);
+
+
+ // Serial.println(&timeinfo, "TIMEINFO %A, %B %d %Y %H:%M:%S");
+
+ 
+  Serial.print("started:");
+  Serial.println(started);
+
+} //end of setup()
+
+long get_period_start_time(long ts)
+{
+  return long(ts / (netting_period_min * 60UL)) * (netting_period_min * 60UL);
 }
 
 void loop()
@@ -945,42 +1178,74 @@ void loop()
     dnsServer.processNextRequest();
   }*/
 
-  current_period_start = int(timeClient.getEpochTime() / (netting_period_min * 60)) * (netting_period_min * 60);
+  time(&now);
+  // current_period_start = long(timeClient.getEpochTime() / (netting_period_min * 60UL)) * (netting_period_min * 60UL);
+  current_period_start = get_period_start_time(now); // long(now / (netting_period_min * 60UL)) * (netting_period_min * 60UL);
+  if (get_period_start_time(now) == get_period_start_time(started))
+    recording_period_start = started;
+  else
+    recording_period_start = current_period_start;
+
+  if (previous_period_start != current_period_start)
+    period_changed = true; // more readable
 
   if (WiFi.waitForConnectResult() != WL_CONNECTED)
   {
     delay(5000);
     return;
   }
+  /*
+  #ifdef SENSOR_DS18B20
+    if ((millis() - ds18B20_last) > ds18B20_interval_s * 1000)
+    {
+      Serial.print(F(" ds18B20 "));
+      read_sensor_ds18B20();
+      ds18B20_last = millis();
+    }
+  #endif
 
+  #ifdef METER_SHELLY3EM
+    if ((millis() - shelly3em_last) > shelly3em_interval_s * 1000)
+    {
+      Serial.print(F(" shelly3em "));
+      read_meter_shelly3em();
+      shelly3em_last = millis();
+    }
+  #endif
+  */
+
+  // TODO: all sensor /meter reads could be here?, do we need diffrent frequencies?
+  if (((millis() - sensor_last_refresh) > sensor_read_interval_s * 1000) or period_changed)
+  {
+    Serial.print(F("Reading sensor and meter data..."));
 #ifdef SENSOR_DS18B20
-  if ((millis() - ds18B20_last) > ds18B20_interval_s * 1000)
-  {
-    Serial.println(F("Calling read_sensor_ds18B20"));
     read_sensor_ds18B20();
-    ds18B20_last = millis();
-  }
 #endif
-
 #ifdef METER_SHELLY3EM
-  if ((millis() - shelly3em_last) > shelly3em_interval_s * 1000)
-  {
-    Serial.println(F("Calling read_meter_shelly3em"));
     read_meter_shelly3em();
-    shelly3em_last = millis();
-  }
 #endif
+#ifdef INVERTER_FRONIUS_SOLARAPI
+    read_inverter_fronius();
+#endif
+    sensor_last_refresh = millis();
+  }
 
 #ifdef QUERY_POWERGURU
-  if ((millis() - powerguru_last) > powerguru_interval_s * 1000)
+  if (((millis() - powerguru_last_refresh) > powerguru_interval_s * 1000) or period_changed)
   {
-    Serial.println(F("Calling query_powerguru"));
-    query_powerguru(current_period_start);
-    powerguru_last = millis();
+    // Serial.println(F("Calling refresh_powerguru"));
+    refresh_powerguru(current_period_start);
+    powerguru_last_refresh = millis();
   }
 #endif
 
   set_relays(); // tässä voisi katsoa onko tarvetta mennä tähän eli onko tullut muutosta
 
-  delay(10000);
+  if (period_changed)
+  {
+    previous_period_start = current_period_start;
+    period_changed = false;
+  }
+
+  delay(5000);
 }
