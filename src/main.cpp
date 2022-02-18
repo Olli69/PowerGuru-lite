@@ -34,8 +34,6 @@
 
 */
 
-
-
 // https://werner.rothschopf.net/202011_arduino_esp8266_ntp_en.htm
 #include <time.h>
 time_t now; // this is the epoch
@@ -44,7 +42,7 @@ tm tm;
 #define MY_NTP_SERVER "europe.pool.ntp.org"
 // for timezone https://github.com/nayarsystems/posix_tz_db/blob/master/zones.csv
 //#define MY_TZ "CET-1CEST,M3.5.0/02,M10.5.0/03"
-//TODO: parametriksi jotenkin
+// TODO: parametriksi jotenkin
 #define MY_TZ "EET-2EEST,M3.5.0/3,M10.5.0/4"
 
 // DNSServer dnsServer;
@@ -77,14 +75,14 @@ float ds18B20_temp_c;
 // char pg_url[] = "http://192.168.66.8:8080/state_series?price_area=FI";
 const char *pg_state_cache_filename = "/pg_state_cache.json";
 
-unsigned powerguru_interval_s = 30;
-unsigned long powerguru_last_refresh = -powerguru_interval_s * 1000; //
+//unsigned powerguru_interval_s = 30;
+//unsigned long powerguru_last_refresh = -powerguru_interval_s * 1000; //
 #endif
 
 #ifdef METER_SHELLY3EM
 // const char *shelly_url = "http://192.168.66.40/status";
 unsigned shelly3em_interval_s = 30;
-unsigned long shelly3em_last = -shelly3em_interval_s * 1000;
+//unsigned long shelly3em_last = -shelly3em_interval_s * 1000;
 #endif
 
 // all read operations at once
@@ -139,7 +137,7 @@ typedef struct
 #endif
 #ifdef INVERTER_FRONIUS_SOLARAPI
   char fronius_address[MAX_URL_STR_LENGTH];
-  uint32_t base_load_W;  //production above base load is "free" to use/store
+  uint32_t base_load_W; // production above base load is "free" to use/store
 #endif
 } settings_struct;
 
@@ -158,7 +156,6 @@ void str_to_uint_array(const char *str_in, uint16_t array_out[CHANNEL_STATES_MAX
     array_out[j] = 0;
   }
 
-  Serial.print("str_to_uint_array->");
   while (ptr)
   {
     Serial.print(atol(ptr));
@@ -171,7 +168,7 @@ void str_to_uint_array(const char *str_in, uint16_t array_out[CHANNEL_STATES_MAX
       break;
     }
   }
-  Serial.println("<-str_to_uint_array");
+  
 
   return;
 }
@@ -371,12 +368,12 @@ void read_inverter_fronius()
   StaticJsonDocument<64> filter;
 
   JsonObject filter_Body_Data = filter["Body"].createNestedObject("Data");
-  filter_Body_Data["TOTAL_ENERGY"] = true;
+  filter_Body_Data["DAY_ENERGY"] = true; //instead of TOTAL_ENERGY
   filter_Body_Data["PAC"] = true;
 
   StaticJsonDocument<256> doc;
   String inverter_url = String(s.fronius_address) + "/solar_api/v1/GetInverterRealtimeData.cgi?scope=Device&DeviceId=1&DataCollection=CumulationInverterData";
-  Serial.println(inverter_url);
+  //Serial.println(inverter_url);
 
   DeserializationError error = deserializeJson(doc, httpGETRequest(inverter_url.c_str(), ""), DeserializationOption::Filter(filter));
 
@@ -396,33 +393,36 @@ void read_inverter_fronius()
 
     if (Body_Data_item.key() == "PAC")
     {
-      Serial.print("PAC:");
-      Serial.println((long)Body_Data_item.value()["Value"]);
+      Serial.print(", PAC:");
+      Serial.print((long)Body_Data_item.value()["Value"]);
       current_power = Body_Data_item.value()["Value"];
     }
-    if (Body_Data_item.key() == "TOTAL_ENERGY")
+    // use DAY_ENERGY (more accurate) instead of TOTAL_ENERGY 
+    if (Body_Data_item.key() == "DAY_ENERGY")
     {
-      Serial.print("TOTAL_ENERGY:");
+      Serial.print("DAY_ENERGY:");
       total_energy = Body_Data_item.value()["Value"];
       if (period_changed)
       {
         Serial.println("PERIOD CHANGED");
         inverter_total_period_init = total_energy;
       }
-      Serial.println((long)Body_Data_item.value()["Value"]);
+      Serial.print((long)Body_Data_item.value()["Value"]);
     }
   }
+  Serial.println();
 
   energy_produced_period = total_energy - inverter_total_period_init;
 
   long int time_since_recording_period_start = now - recording_period_start;
-
+/*
   Serial.print("now:");
   Serial.println(now);
   Serial.print("recording_period_start:");
   Serial.println(recording_period_start);
+  */
 
-  if (time_since_recording_period_start < 60) // 60 is just estimate
+  if (time_since_recording_period_start > 60) // in the beginning of period use current power, 60 is  an estimate
     power_produced_period_avg = energy_produced_period * 3600 / time_since_recording_period_start;
   else
     power_produced_period_avg = current_power;
@@ -464,12 +464,12 @@ bool is_cache_file_valid(const char *cache_file_name, unsigned long max_age_sec)
   time(&now);
   // unsigned long age = timeClient.getEpochTime() - ts;
   unsigned long age = now - ts;
-
+/*
   Serial.print("ts:");
   Serial.print(ts);
   Serial.print(", age:");
   Serial.println(age);
-
+*/
   if (age > max_age_sec)
   {
     return false;
@@ -479,15 +479,46 @@ bool is_cache_file_valid(const char *cache_file_name, unsigned long max_age_sec)
     return true;
   }
 }
+#endif
 
-void refresh_powerguru(unsigned long current_period_start)
+// returns next index ie number of elements
+byte get_internal_states(uint16_t state_array[CHANNEL_STATES_MAX])
 {
+  // clean old
+  for (int i = 0; i < CHANNEL_STATES_MAX; i++)
+  {
+    state_array[i] = 0;
+  }
+  // add internally generated states, see https://github.com/Olli69/PowerGuru/blob/main/docs/states.md
+  byte idx = 0;
+  state_array[idx++] = 1;                // 1 is always on
+  state_array[idx++] = 100 + tm.tm_hour; // time/hour based
+
+#ifdef METER_SHELLY3EM
+  state_array[idx++] = (energyin - energyout - energyin_prev + energyout_prev) > 0 ? 1001 : 1002;
+#endif
+
+#ifdef INVERTER_FRONIUS_SOLARAPI
+  if (power_produced_period_avg > s.base_load_W) //"extra" energy produced, more than estimated base load
+    state_array[idx++] = 1003;
+#endif
+  return idx;
+}
+
+void refresh_states(unsigned long current_period_start)
+{
+   //get first internal states, then add  more from PG server
+  byte idx = get_internal_states(active_states);
+
+#ifndef QUERY_POWERGURU
+    return; //fucntionality disabled
+#endif
   if (strlen(s.pg_url) == 0)
     return;
 
   time(&now);
   localtime_r(&now, &tm);
-  Serial.print(" refresh_powerguru ");
+  Serial.print(" refresh_states ");
   // Serial.print(timeClient.getFormattedTime());
   Serial.print(F("  current_period_start: "));
   Serial.println(current_period_start);
@@ -499,6 +530,7 @@ void refresh_powerguru(unsigned long current_period_start)
 
   StaticJsonDocument<200> doc;
   DeserializationError error;
+
 
   if (is_cache_file_valid(pg_state_cache_filename, s.pg_cache_age))
   {
@@ -539,45 +571,9 @@ void refresh_powerguru(unsigned long current_period_start)
   }
 
   JsonArray state_list = doc[start_str];
-  /*
-  Serial.print("state_list info:");
-  Serial.print(start_str);
-  Serial.print("size:");
-  Serial.println(state_list.size());
 
-*/
-  // clean old
-  for (int i = 0; i < CHANNEL_STATES_MAX; i++)
-  {
-    active_states[i] = 0;
-  }
-  // add internally generated states, see https://github.com/Olli69/PowerGuru/blob/main/docs/states.md
-  byte idx = 0;
-  active_states[idx++] = 1; // always on
-                            // add locally generated states, tämön voisi laittaa omaksi metodiksi
-                            // How about local time
-  // active_states[idx++] = 100 + timeClient.getHours();
-  active_states[idx++] = 100 + tm.tm_hour;
-
-#ifdef METER_SHELLY3EM
-  active_states[idx++] = (energyin - energyout - energyin_prev + energyout_prev) > 0 ? 1001 : 1002;
-#endif
-
-#ifdef INVERTER_FRONIUS_SOLARAPI
-  if (power_produced_period_avg>s.base_load_W) //"extra" energy produced, more than estimated base load
-  active_states[idx++] =  1003; 
-#endif
-
-
-  // for (unsigned int i = idx; i < state_list.size(); i++)
   for (unsigned int i = 0; i < state_list.size(); i++)
   {
-    // for (String state : doc["states"].as<String>()) {
-    //  const char* states_0 = states[0];
-    /* Serial.print("state:");
-     Serial.print((const char *)state_list[i]);
-     Serial.print("#");
-     Serial.println((int)state_list[i]); */
     active_states[idx++] = (uint16_t)state_list[i];
     if (idx == CHANNEL_STATES_MAX)
       break;
@@ -593,7 +589,6 @@ void refresh_powerguru(unsigned long current_period_start)
   }
   Serial.println();
 }
-#endif
 
 // https://github.com/me-no-dev/ESPAsyncWebServer#send-large-webpage-from-progmem-containing-templates
 const char setup_form_html[] PROGMEM = R"===(<html>
@@ -608,7 +603,7 @@ const char setup_form_html[] PROGMEM = R"===(<html>
       }
       h3 {margin-block-start: 3em;}
       input {font-size:2em;}
-      input[type=checkbox] {width:50px;}
+      input[type=checkbox] {width:50px;height:50px;}
       input[type=submit] {margin-top:30px;}
       .fld {margin-top: 10px;clear:both;}
       .fldh { width:45%%;margin-right:3%%; }
@@ -634,12 +629,13 @@ const char setup_form_html[] PROGMEM = R"===(<html>
 
 <div class="fldlong"><div>Powerguru server url</div><div><input name="pg_url" type="text" value="%pg_url%"></div></div>
 <div class="fldshort">Max cache age (s): <input name="pg_cache_age" type="text" value="%pg_cache_age%"></div>
-
-
-
+<br>
+<h2>Status</h2>
+<div class="fld"><div>Current sensor value: %sensorv0%</div></div>
+<div class="fld"><div>Active states: %states%</div></div>
+<p>Refresh to update.</p>
 
 <h2>Channels</h2>
-<div class="fld"><div>Current sensor value: %sensorv0%</div></div>
 <h3>Channel 1</h3>
 <div class="fld"><div>Current status: %up_ch0%</div></div>
 <div class="fldlong"><div>Up on states</div><div><input name="states_ch0" type="text" value="%upstates_ch0%"></div></div>
@@ -647,7 +643,7 @@ const char setup_form_html[] PROGMEM = R"===(<html>
 
 <div class="fld">Channel options
 <div class="fldshort">Base target: <input name="t_b_ch0" type="text" value="%t_b_ch0%"></div>
-<div class="fldshort"><input type="checkbox"  name="du_ch0" value="du_ch0" %du_ch0%><label for="du_ch0"> default up</label></div>
+<div class="fldshort"><label for="du_ch0"> default up:</label><br><input type="checkbox"  name="du_ch0" value="du_ch0" %du_ch0%></div>
 <div class="fldshort">gpio: <input name="gpio_ch0" type="text" value="%gpio_ch0%"></div>
 </div>
 
@@ -659,7 +655,7 @@ const char setup_form_html[] PROGMEM = R"===(<html>
 
 <div class="fld">Channel options
 <div class="fldshort">Base target: <input name="t_b_ch1" type="text" value="%t_b_ch1%"></div>
-<div class="fldshort"><input type="checkbox"  name="du_ch1" value="du_ch1" %du_ch1% ><label for="du_ch1"> default up</label></div>
+<div class="fldshort"><label for="du_ch1"> default up:</label><br><input type="checkbox"  name="du_ch1" value="du_ch1" %du_ch1% ></div>
 <div class="fldshort">gpio: <input name="gpio_ch1" type="text" value="%gpio_ch1%"></div>
 </div>
 
@@ -698,16 +694,30 @@ String setup_form_processor(const String &var)
 #ifdef INVERTER_FRONIUS_SOLARAPI
     return String(s.base_load_W);
 #else
-    return F("(disabled)")
+            return F("(disabled)")
 #endif
-
 
   if (var == "sensorv0")
 #ifdef SENSOR_DS18B20
     return String(ds18B20_temp_c);
 #else
-    return String("not in use");
+                    return String("not in use");
 #endif
+
+if (var == "states") {
+  String states = String();
+  for (int i = 0; i < CHANNEL_STATES_MAX; i++)
+  {
+    if (active_states[i] > 0) {
+      states += String(active_states[i]);
+      if (i+1 <CHANNEL_STATES_MAX && (active_states[i+1] > 0) ) 
+        states += String(",");
+      }
+    else
+      break;
+  }
+  return states;
+}
 
 #ifdef QUERY_POWERGURU
   if (var == "pg_url")
@@ -952,7 +962,7 @@ void onWebStatusGet(AsyncWebServerRequest *request)
   // TODO: näistä puuttu nyt sisäiset, pitäisikö lisätä vai poistaa kokonaan, onko tarvetta debugille
   for (int i = 0; i < CHANNEL_STATES_MAX; i++)
   {
-   // doc["states"][i] = active_states[i];
+    // doc["states"][i] = active_states[i];
     if (active_states[i] > 0)
       doc["states"][i] = active_states[i];
     else
@@ -1008,10 +1018,10 @@ void setup()
     Serial.print(F("Setting gpio "));
     Serial.println(s.ch[i].gpio);
     pinMode(s.ch[i].gpio, OUTPUT);
-    //if up/down up-to-date stored to non-volatile:
-    //digitalWrite(s.ch[i].gpio, (s.ch[i].is_up ? HIGH : LOW));
-    // use defaults
-    digitalWrite(s.ch[i].gpio, (s.ch[i].default_up? HIGH : LOW));
+    // if up/down up-to-date stored to non-volatile:
+    // digitalWrite(s.ch[i].gpio, (s.ch[i].is_up ? HIGH : LOW));
+    //  use defaults
+    digitalWrite(s.ch[i].gpio, (s.ch[i].default_up ? HIGH : LOW));
   }
   /*
     if (1 == 2) //Softap should be created if cannot connect to wifi (like in init), redirect
@@ -1086,7 +1096,7 @@ void setup()
   Serial.println(ESP.getFreeHeap());
 
 #ifdef QUERY_POWERGURU
-  powerguru_last_refresh = -powerguru_interval_s * 1000;
+  //powerguru_last_refresh = -powerguru_interval_s * 1000;
   // strcpy(s.pg_url, "http://192.168.66.8:8080/state_series?price_area=FI");
 #endif
 
@@ -1150,17 +1160,20 @@ void loop()
 #ifdef INVERTER_FRONIUS_SOLARAPI
     read_inverter_fronius();
 #endif
+    refresh_states(current_period_start);
     sensor_last_refresh = millis();
+    set_relays(); // tässä voisi katsoa onko tarvetta mennä tähän eli onko tullut muutosta
   }
-
+/*
 #ifdef QUERY_POWERGURU
   if (((millis() - powerguru_last_refresh) > powerguru_interval_s * 1000) or period_changed)
   {
-    // Serial.println(F("Calling refresh_powerguru"));
-    refresh_powerguru(current_period_start);
+    // Serial.println(F("Calling refresh_states"));
+    refresh_states(current_period_start);
     powerguru_last_refresh = millis();
   }
 #endif
+*/
 
   set_relays(); // tässä voisi katsoa onko tarvetta mennä tähän eli onko tullut muutosta
 
