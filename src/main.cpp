@@ -77,14 +77,14 @@ float ds18B20_temp_c;
 // char pg_url[] = "http://192.168.66.8:8080/state_series?price_area=FI";
 const char *pg_state_cache_filename = "/pg_state_cache.json";
 
-//unsigned powerguru_interval_s = 30;
-//unsigned long powerguru_last_refresh = -powerguru_interval_s * 1000; //
+// unsigned powerguru_interval_s = 30;
+// unsigned long powerguru_last_refresh = -powerguru_interval_s * 1000; //
 #endif
 
 #ifdef METER_SHELLY3EM
 // const char *shelly_url = "http://192.168.66.40/status";
 unsigned shelly3em_interval_s = 30;
-//unsigned long shelly3em_last = -shelly3em_interval_s * 1000;
+// unsigned long shelly3em_last = -shelly3em_interval_s * 1000;
 #endif
 
 // all read operations at once
@@ -113,17 +113,18 @@ bool period_changed = false;
 #define MAX_URL_STR_LENGTH 70
 // nämä flashiin, voisiko olla array of unsigned int 0-65k
 
-//uusi tapa, under construction
-typedef struct {
+// uusi tapa, under construction
+typedef struct
+{
   uint16_t upstates[CHANNEL_STATES_MAX];
   float target;
 } target_struct;
 
 typedef struct
 {
-  uint16_t upstates_ch[CHANNEL_STATES_MAX];//tämä pois
-  float target_b_ch; //tämä pois
-  float target_u_ch; // tämä pois
+  uint16_t upstates_ch[CHANNEL_STATES_MAX]; // tämä pois
+  float target_b_ch;                        // tämä pois
+  float target_u_ch;                        // tämä pois
   bool is_up;
   bool default_up;
   uint8_t gpio;
@@ -155,10 +156,8 @@ typedef struct
 
 settings_struct s;
 
-
 // channel_struct ch[CHANNELS];
 uint16_t active_states[ACTIVE_STATES_MAX];
-
 
 void str_to_uint_array(const char *str_in, uint16_t array_out[CHANNEL_STATES_MAX])
 {
@@ -380,12 +379,12 @@ void read_inverter_fronius()
   StaticJsonDocument<64> filter;
 
   JsonObject filter_Body_Data = filter["Body"].createNestedObject("Data");
-  filter_Body_Data["DAY_ENERGY"] = true; //instead of TOTAL_ENERGY
+  filter_Body_Data["DAY_ENERGY"] = true; // instead of TOTAL_ENERGY
   filter_Body_Data["PAC"] = true;
 
   StaticJsonDocument<256> doc;
   String inverter_url = String(s.fronius_address) + "/solar_api/v1/GetInverterRealtimeData.cgi?scope=Device&DeviceId=1&DataCollection=CumulationInverterData";
-  //Serial.println(inverter_url);
+  // Serial.println(inverter_url);
 
   DeserializationError error = deserializeJson(doc, httpGETRequest(inverter_url.c_str(), ""), DeserializationOption::Filter(filter));
 
@@ -409,7 +408,7 @@ void read_inverter_fronius()
       Serial.print((long)Body_Data_item.value()["Value"]);
       current_power = Body_Data_item.value()["Value"];
     }
-    // use DAY_ENERGY (more accurate) instead of TOTAL_ENERGY 
+    // use DAY_ENERGY (more accurate) instead of TOTAL_ENERGY
     if (Body_Data_item.key() == "DAY_ENERGY")
     {
       Serial.print("DAY_ENERGY:");
@@ -427,12 +426,12 @@ void read_inverter_fronius()
   energy_produced_period = total_energy - inverter_total_period_init;
 
   long int time_since_recording_period_start = now - recording_period_start;
-/*
-  Serial.print("now:");
-  Serial.println(now);
-  Serial.print("recording_period_start:");
-  Serial.println(recording_period_start);
-  */
+  /*
+    Serial.print("now:");
+    Serial.println(now);
+    Serial.print("recording_period_start:");
+    Serial.println(recording_period_start);
+    */
 
   if (time_since_recording_period_start > 60) // in the beginning of period use current power, 60 is  an estimate
     power_produced_period_avg = energy_produced_period * 3600 / time_since_recording_period_start;
@@ -476,12 +475,12 @@ bool is_cache_file_valid(const char *cache_file_name, unsigned long max_age_sec)
   time(&now);
   // unsigned long age = timeClient.getEpochTime() - ts;
   unsigned long age = now - ts;
-/*
-  Serial.print("ts:");
-  Serial.print(ts);
-  Serial.print(", age:");
-  Serial.println(age);
-*/
+  /*
+    Serial.print("ts:");
+    Serial.print(ts);
+    Serial.print(", age:");
+    Serial.println(age);
+  */
   if (age > max_age_sec)
   {
     return false;
@@ -511,32 +510,35 @@ byte get_internal_states(uint16_t state_array[CHANNEL_STATES_MAX])
 #endif
 
 #ifdef TARIFF_STATES_FI
-/*
-130 RFU	päiväsähkö, daytime 07-22:, every day
-131 RFU	yösähkö, 22-07, every day
-140 RFU	kausisähkö talvipäivä, Nov 1- Mar 31 07-22, Mon-Sat
-141 RFU	kausisähkö, other time
-*/
+  /*
+  130 RFU	päiväsähkö, daytime 07-22:, every day
+  131 RFU	yösähkö, 22-07, every day
+  140 RFU	kausisähkö talvipäivä, Nov 1- Mar 31 07-22, Mon-Sat
+  141 RFU	kausisähkö, other time
+  */
 
-  //päiväsähkö/yösähkö (Finnish day/night tariff) 
-  if (6<tm.tm_hour && tm.tm_hour <22) { //day
+  // päiväsähkö/yösähkö (Finnish day/night tariff)
+  if (6 < tm.tm_hour && tm.tm_hour < 22)
+  { // day
     state_array[idx++] = 130;
   }
-  else {
+  else
+  {
     state_array[idx++] = 131;
   }
-  //Finnish seasonal tariff, talvipäivä/winter day
-  if ((6<tm.tm_hour && tm.tm_hour <22) && (tm.tm_mon>9 || tm.tm_mon<3) && tm.tm_wday!=0) { 
+  // Finnish seasonal tariff, talvipäivä/winter day
+  if ((6 < tm.tm_hour && tm.tm_hour < 22) && (tm.tm_mon > 9 || tm.tm_mon < 3) && tm.tm_wday != 0)
+  {
     state_array[idx++] = 140;
   }
-  else {
+  else
+  {
     state_array[idx++] = 141;
   }
 #endif
 
-
 #ifdef INVERTER_FRONIUS_SOLARAPI
-  if (power_produced_period_avg > (s.base_load_W +WATT_EPSILON)) //"extra" energy produced, more than estimated base load
+  if (power_produced_period_avg > (s.base_load_W + WATT_EPSILON)) //"extra" energy produced, more than estimated base load
     state_array[idx++] = 1003;
 #endif
   return idx;
@@ -544,11 +546,11 @@ byte get_internal_states(uint16_t state_array[CHANNEL_STATES_MAX])
 
 void refresh_states(unsigned long current_period_start)
 {
-   //get first internal states, then add  more from PG server
+  // get first internal states, then add  more from PG server
   byte idx = get_internal_states(active_states);
 
 #ifndef QUERY_POWERGURU
-    return; //fucntionality disabled
+  return; // fucntionality disabled
 #endif
   if (strlen(s.pg_url) == 0)
     return;
@@ -567,7 +569,6 @@ void refresh_states(unsigned long current_period_start)
 
   StaticJsonDocument<200> doc;
   DeserializationError error;
-
 
   if (is_cache_file_valid(pg_state_cache_filename, s.pg_cache_age))
   {
@@ -626,8 +627,6 @@ void refresh_states(unsigned long current_period_start)
   }
   Serial.println();
 }
-
-
 
 // https://github.com/me-no-dev/ESPAsyncWebServer#send-large-webpage-from-progmem-containing-templates
 const char setup_form_html[] PROGMEM = R"===(<html>
@@ -710,25 +709,28 @@ const char setup_form_html[] PROGMEM = R"===(<html>
 </form>
 </body></html>)===";
 
-String state_array_string(uint16_t state_array[CHANNEL_STATES_MAX]) {
+String state_array_string(uint16_t state_array[CHANNEL_STATES_MAX])
+{
   String states = String();
   for (int i = 0; i < CHANNEL_STATES_MAX; i++)
   {
-    if (state_array[i] > 0) {
+    if (state_array[i] > 0)
+    {
       states += String(state_array[i]);
-      if (i+1 <CHANNEL_STATES_MAX && (state_array[i+1] > 0) ) 
+      if (i + 1 < CHANNEL_STATES_MAX && (state_array[i + 1] > 0))
         states += String(",");
-      }
+    }
     else
       break;
   }
   return states;
 }
 
-void get_channel_target_fields(char *out, int channel_idx, int target_idx) {
- // char out[400];
+void get_channel_target_fields(char *out, int channel_idx, int target_idx)
+{
+  // char out[400];
   String states = state_array_string(s.ch[channel_idx].target[target_idx].upstates);
-  snprintf(out, 400, "<div>#%i priority target<div  class=\"fldlong\"><input name=\"st_%i_t%i\" type=\"text\" value=\"%s\"></div></div><div class=\"fldshort\">Target:<input name = \"t_%i_t%i\" type =\"text\" value = \"%f\"></div></div>",target_idx+1, channel_idx, target_idx, states.c_str(), channel_idx, target_idx, s.ch[channel_idx].target[target_idx].target);
+  snprintf(out, 400, "<div><div  class=\"fldlong\">#%i priority target<input name=\"st_%i_t%i\" type=\"text\" value=\"%s\"></div></div><div class=\"fldshort\">Target:<input name = \"t_%i_t%i\" type =\"text\" value = \"%f\"></div></div>", target_idx + 1, channel_idx, target_idx, states.c_str(), channel_idx, target_idx, s.ch[channel_idx].target[target_idx].target);
 
   return;
 }
@@ -771,38 +773,42 @@ String setup_form_processor(const String &var)
 #ifdef SENSOR_DS18B20
     return String(ds18B20_temp_c);
 #else
-    return F("not in use");
+                    return F("not in use");
 #endif
-if (var.startsWith("target_ch_")) {
-  // e.g target_ch_0_1
-  char out[400];
-  int channel_idx = var.substring(10, 10).toInt();
-  int target_idx = var.substring(12, 12).toInt();
-  Serial.print("channel_idx olisko:");
-  Serial.println(var.substring(10, 10));
-  //var.s
-
-  get_channel_target_fields(out, channel_idx, target_idx);
-  return out;
-}
-if (var == "states") {
-  //char out[400];
-  //char[CHANNEL_STATES_MAX * 6 + 1];
-  return state_array_string(active_states);
-  /*
-  String states = String();
-  for (int i = 0; i < CHANNEL_STATES_MAX; i++)
+  if (var.startsWith("target_ch_"))
   {
-    if (active_states[i] > 0) {
-      states += String(active_states[i]);
-      if (i+1 <CHANNEL_STATES_MAX && (active_states[i+1] > 0) ) 
-        states += String(",");
-      }
-    else
-      break;
+    // e.g target_ch_0_1
+    char out[400];
+    int channel_idx = var.substring(10, 11).toInt();
+    int target_idx = var.substring(12, 13).toInt();
+    Serial.print("channel_idx olisko:");
+    Serial.println(var.substring(10, 11));
+    Serial.print("#");
+    Serial.println(var);
+    // var.s
+
+    get_channel_target_fields(out, channel_idx, target_idx);
+    return out;
   }
-  return states;*/
-}
+  if (var == "states")
+  {
+    // char out[400];
+    // char[CHANNEL_STATES_MAX * 6 + 1];
+    return state_array_string(active_states);
+    /*
+    String states = String();
+    for (int i = 0; i < CHANNEL_STATES_MAX; i++)
+    {
+      if (active_states[i] > 0) {
+        states += String(active_states[i]);
+        if (i+1 <CHANNEL_STATES_MAX && (active_states[i+1] > 0) )
+          states += String(",");
+        }
+      else
+        break;
+    }
+    return states;*/
+  }
 
 #ifdef QUERY_POWERGURU
   if (var == "pg_url")
@@ -1001,7 +1007,26 @@ void onWebRootPost(AsyncWebServerRequest *request)
     s.ch[1].target_b_ch = request->getParam("t_b_ch1", true)->value().toFloat();
     s.ch[1].target_u_ch = request->getParam("t_u_ch1", true)->value().toFloat();
   }
-
+  char state_fld[8];
+  char target_fld[7];
+  for (int channel_idx = 0; channel_idx < CHANNELS; channel_idx++)
+  {
+    for (int target_idx = 0; target_idx < CHANNEL_TARGETS_MAX; target_idx++)
+    {
+      snprintf(state_fld, 8, "st_%i_t%i", channel_idx, target_idx);
+      snprintf(target_fld, 7, "t_%i_t%i", channel_idx, target_idx);
+      if (request->hasParam(state_fld, true))
+      { Serial.print("ON:");
+        Serial.println(state_fld);
+        str_to_uint_array(request->getParam(state_fld, true)->value().c_str(), s.ch[channel_idx].target[target_idx].upstates);
+        s.ch[channel_idx].target[target_idx].target = request->getParam(target_fld, true)->value().toFloat();
+      }
+      else {
+        Serial.print("EI OO:");
+        Serial.println(state_fld);
+      }
+    }
+  }
   // save to non-volatile memory
   writeToEEPROM();
 
@@ -1182,8 +1207,8 @@ void setup()
   Serial.println(ESP.getFreeHeap());
 
 #ifdef QUERY_POWERGURU
-  //powerguru_last_refresh = -powerguru_interval_s * 1000;
-  // strcpy(s.pg_url, "http://192.168.66.8:8080/state_series?price_area=FI");
+  // powerguru_last_refresh = -powerguru_interval_s * 1000;
+  //  strcpy(s.pg_url, "http://192.168.66.8:8080/state_series?price_area=FI");
 #endif
 
   // first period is not full, so start calculations from now
@@ -1196,8 +1221,6 @@ void setup()
     delay(500);
     Serial.print("*");
   } while (started < 1645106860);
-
-  // Serial.println(&timeinfo, "TIMEINFO %A, %B %d %Y %H:%M:%S");
 
   Serial.print("started:");
   Serial.println(started);
@@ -1250,16 +1273,16 @@ void loop()
     sensor_last_refresh = millis();
     set_relays(); // tässä voisi katsoa onko tarvetta mennä tähän eli onko tullut muutosta
   }
-/*
-#ifdef QUERY_POWERGURU
-  if (((millis() - powerguru_last_refresh) > powerguru_interval_s * 1000) or period_changed)
-  {
-    // Serial.println(F("Calling refresh_states"));
-    refresh_states(current_period_start);
-    powerguru_last_refresh = millis();
-  }
-#endif
-*/
+  /*
+  #ifdef QUERY_POWERGURU
+    if (((millis() - powerguru_last_refresh) > powerguru_interval_s * 1000) or period_changed)
+    {
+      // Serial.println(F("Calling refresh_states"));
+      refresh_states(current_period_start);
+      powerguru_last_refresh = millis();
+    }
+  #endif
+  */
 
   set_relays(); // tässä voisi katsoa onko tarvetta mennä tähän eli onko tullut muutosta
 
