@@ -18,9 +18,11 @@
 #define METER_SHELLY3EM
 #define SENSOR_DS18B20
 #define INVERTER_FRONIUS_SOLARAPI
+#define TARIFF_STATES_FI // add Finnish tariffs (yösähkö,kausisähkö) to active states
 
 #define RTCMEMORYSTART 65
 #define eepromaddr 0
+#define WATT_EPSILON 50
 
 #include <ESPAsyncWebServer.h>
 /* TODO: and caveats
@@ -103,19 +105,29 @@ time_t started = 0;
 bool period_changed = false;
 
 #define CHANNELS 2
+#define CHANNEL_TARGETS_MAX 3
 #define CHANNEL_STATES_MAX 10
+#define ACTIVE_STATES_MAX 20
+
 #define MAX_ID_STR_LENGTH 30
 #define MAX_URL_STR_LENGTH 70
 // nämä flashiin, voisiko olla array of unsigned int 0-65k
+
+//uusi tapa, under construction
+typedef struct {
+  uint16_t upstates[CHANNEL_STATES_MAX];
+  float target;
+} target_struct;
+
 typedef struct
 {
-  uint16_t upstates_ch[CHANNEL_STATES_MAX];
-  float target_b_ch;
-  float target_u_ch;
+  uint16_t upstates_ch[CHANNEL_STATES_MAX];//tämä pois
+  float target_b_ch; //tämä pois
+  float target_u_ch; // tämä pois
   bool is_up;
   bool default_up;
   uint8_t gpio;
-
+  target_struct target[CHANNEL_TARGETS_MAX]; // new way
 } channel_struct;
 
 // TODO: add fixed ip, subnet?
@@ -143,8 +155,10 @@ typedef struct
 
 settings_struct s;
 
+
 // channel_struct ch[CHANNELS];
-uint16_t active_states[CHANNEL_STATES_MAX];
+uint16_t active_states[ACTIVE_STATES_MAX];
+
 
 void str_to_uint_array(const char *str_in, uint16_t array_out[CHANNEL_STATES_MAX])
 {
@@ -168,8 +182,6 @@ void str_to_uint_array(const char *str_in, uint16_t array_out[CHANNEL_STATES_MAX
       break;
     }
   }
-  
-
   return;
 }
 
@@ -305,7 +317,7 @@ void read_meter_shelly3em()
   DeserializationError error = deserializeJson(doc, httpGETRequest(s.shelly_url, ""));
   if (error)
   {
-    Serial.print(F("Meter deserializeJson() failed: "));
+    Serial.print(F("Shelly meter deserializeJson() failed: "));
     Serial.println(error.f_str());
     return;
   }
@@ -379,7 +391,7 @@ void read_inverter_fronius()
 
   if (error)
   {
-    Serial.print(F("deserializeJson() failed: "));
+    Serial.print(F("Fronius inverter deserializeJson() failed: "));
     Serial.println(error.f_str());
     energy_produced_period = 0;
     power_produced_period_avg = 0;
@@ -455,7 +467,7 @@ bool is_cache_file_valid(const char *cache_file_name, unsigned long max_age_sec)
 
   if (error)
   {
-    Serial.print(F("deserializeJson() failed: "));
+    Serial.print(F("Powerguru server deserializeJson() failed: "));
     Serial.println(error.f_str());
     return false;
   }
@@ -498,8 +510,33 @@ byte get_internal_states(uint16_t state_array[CHANNEL_STATES_MAX])
   state_array[idx++] = (energyin - energyout - energyin_prev + energyout_prev) > 0 ? 1001 : 1002;
 #endif
 
+#ifdef TARIFF_STATES_FI
+/*
+130 RFU	päiväsähkö, daytime 07-22:, every day
+131 RFU	yösähkö, 22-07, every day
+140 RFU	kausisähkö talvipäivä, Nov 1- Mar 31 07-22, Mon-Sat
+141 RFU	kausisähkö, other time
+*/
+
+  //päiväsähkö/yösähkö (Finnish day/night tariff) 
+  if (6<tm.tm_hour && tm.tm_hour <22) { //day
+    state_array[idx++] = 130;
+  }
+  else {
+    state_array[idx++] = 131;
+  }
+  //Finnish seasonal tariff, talvipäivä/winter day
+  if ((6<tm.tm_hour && tm.tm_hour <22) && (tm.tm_mon>9 || tm.tm_mon<3) && tm.tm_wday!=0) { 
+    state_array[idx++] = 140;
+  }
+  else {
+    state_array[idx++] = 141;
+  }
+#endif
+
+
 #ifdef INVERTER_FRONIUS_SOLARAPI
-  if (power_produced_period_avg > s.base_load_W) //"extra" energy produced, more than estimated base load
+  if (power_produced_period_avg > (s.base_load_W +WATT_EPSILON)) //"extra" energy produced, more than estimated base load
     state_array[idx++] = 1003;
 #endif
   return idx;
@@ -590,6 +627,8 @@ void refresh_states(unsigned long current_period_start)
   Serial.println();
 }
 
+
+
 // https://github.com/me-no-dev/ESPAsyncWebServer#send-large-webpage-from-progmem-containing-templates
 const char setup_form_html[] PROGMEM = R"===(<html>
 <head>
@@ -634,7 +673,15 @@ const char setup_form_html[] PROGMEM = R"===(<html>
 <div class="fld"><div>Current sensor value: %sensorv0%</div></div>
 <div class="fld"><div>Active states: %states%</div></div>
 <p>Refresh to update.</p>
-
+<h2>uusi</h2>
+<h3>Channel 1</h3>
+%target_ch_0_0%
+%target_ch_0_1%
+%target_ch_0_2%
+<h3>Channel 2</h3>
+%target_ch_1_0%
+%target_ch_1_1%
+%target_ch_1_2%
 <h2>Channels</h2>
 <h3>Channel 1</h3>
 <div class="fld"><div>Current status: %up_ch0%</div></div>
@@ -663,6 +710,29 @@ const char setup_form_html[] PROGMEM = R"===(<html>
 </form>
 </body></html>)===";
 
+String state_array_string(uint16_t state_array[CHANNEL_STATES_MAX]) {
+  String states = String();
+  for (int i = 0; i < CHANNEL_STATES_MAX; i++)
+  {
+    if (state_array[i] > 0) {
+      states += String(state_array[i]);
+      if (i+1 <CHANNEL_STATES_MAX && (state_array[i+1] > 0) ) 
+        states += String(",");
+      }
+    else
+      break;
+  }
+  return states;
+}
+
+void get_channel_target_fields(char *out, int channel_idx, int target_idx) {
+ // char out[400];
+  String states = state_array_string(s.ch[channel_idx].target[target_idx].upstates);
+  snprintf(out, 400, "<div>#%i priority target<div  class=\"fldlong\"><input name=\"st_%i_t%i\" type=\"text\" value=\"%s\"></div></div><div class=\"fldshort\">Target:<input name = \"t_%i_t%i\" type =\"text\" value = \"%f\"></div></div>",target_idx+1, channel_idx, target_idx, states.c_str(), channel_idx, target_idx, s.ch[channel_idx].target[target_idx].target);
+
+  return;
+}
+
 String setup_form_processor(const String &var)
 {
 
@@ -674,7 +744,7 @@ String setup_form_processor(const String &var)
     return s.wifi_password;
   if (var == "http_username")
     // return s.http_username;
-    return String("powerguru");
+    return F("powerguru");
   if (var == "http_password")
     return s.http_password;
 
@@ -701,10 +771,25 @@ String setup_form_processor(const String &var)
 #ifdef SENSOR_DS18B20
     return String(ds18B20_temp_c);
 #else
-                    return String("not in use");
+    return F("not in use");
 #endif
+if (var.startsWith("target_ch_")) {
+  // e.g target_ch_0_1
+  char out[400];
+  int channel_idx = var.substring(10, 10).toInt();
+  int target_idx = var.substring(12, 12).toInt();
+  Serial.print("channel_idx olisko:");
+  Serial.println(var.substring(10, 10));
+  //var.s
 
+  get_channel_target_fields(out, channel_idx, target_idx);
+  return out;
+}
 if (var == "states") {
+  //char out[400];
+  //char[CHANNEL_STATES_MAX * 6 + 1];
+  return state_array_string(active_states);
+  /*
   String states = String();
   for (int i = 0; i < CHANNEL_STATES_MAX; i++)
   {
@@ -716,7 +801,7 @@ if (var == "states") {
     else
       break;
   }
-  return states;
+  return states;*/
 }
 
 #ifdef QUERY_POWERGURU
@@ -958,7 +1043,7 @@ void onWebStatusGet(AsyncWebServerRequest *request)
 
   variables["updated"] = now_ts;
   variables["freeHeap"] = ESP.getFreeHeap();
-
+  variables["uptime"] = (unsigned long)(millis() / 1000);
   // TODO: näistä puuttu nyt sisäiset, pitäisikö lisätä vai poistaa kokonaan, onko tarvetta debugille
   for (int i = 0; i < CHANNEL_STATES_MAX; i++)
   {
@@ -1075,7 +1160,8 @@ void setup()
     }
   }
 
-  // TODO: prepare for no internet connection -> channel defaults probably, RTC?
+  // TODO: prepare for no internet connection? -> channel defaults probably, RTC?
+  // https://werner.rothschopf.net/202011_arduino_esp8266_ntp_en.htm
   configTime(MY_TZ, MY_NTP_SERVER); // --> Here is the IMPORTANT ONE LINER needed in your sketch!
 
   server.on("/reset", HTTP_GET, onWebResetGet);
