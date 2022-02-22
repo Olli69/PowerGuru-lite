@@ -122,11 +122,11 @@ typedef struct
 
 typedef struct
 {
-  uint16_t upstates_ch[CHANNEL_STATES_MAX]; // tämä pois
-  float target_b_ch;                        // tämä pois
-  float target_u_ch;                        // tämä pois
+  // uint16_t upstates_ch[CHANNEL_STATES_MAX]; // tämä pois
+  // float target_b_ch;                        // tämä pois
+  // float target_u_ch;                        // tämä pois
   bool is_up;
-  bool default_up;
+  bool default_up; // tämäkin kai pois
   uint8_t gpio;
   target_struct target[CHANNEL_TARGETS_MAX]; // new way
 } channel_struct;
@@ -156,7 +156,6 @@ typedef struct
 
 settings_struct s;
 
-// channel_struct ch[CHANNELS];
 uint16_t active_states[ACTIVE_STATES_MAX];
 
 void str_to_uint_array(const char *str_in, uint16_t array_out[CHANNEL_STATES_MAX])
@@ -164,9 +163,9 @@ void str_to_uint_array(const char *str_in, uint16_t array_out[CHANNEL_STATES_MAX
   char *ptr = strtok((char *)str_in, ",");
   byte i = 0;
 
-  for (int j = 0; j < CHANNEL_STATES_MAX; j++)
+  for (int ch_state_idx = 0; ch_state_idx < CHANNEL_STATES_MAX; ch_state_idx++)
   {
-    array_out[j] = 0;
+    array_out[ch_state_idx] = 0;
   }
 
   while (ptr)
@@ -570,6 +569,8 @@ void refresh_states(unsigned long current_period_start)
   StaticJsonDocument<200> doc;
   DeserializationError error;
 
+  // TODO: what happens if cache is expired and no connection to state server
+
   if (is_cache_file_valid(pg_state_cache_filename, s.pg_cache_age))
   {
     Serial.println(F("Using cached data"));
@@ -585,19 +586,41 @@ void refresh_states(unsigned long current_period_start)
 
     // StaticJsonDocument<400> doc;
     String url_to_call = String(s.pg_url) + "&states=";
+    String url_states_part = ",";
+    char state_str_buffer[8];
+    // char *ptr = 0;
 
-    for (int i = 0; i < CHANNELS; i++)
-      for (int j = 0; j < CHANNEL_STATES_MAX; j++)
+    // add only used states to to state query
+    for (int channel_idx = 0; channel_idx < CHANNELS; channel_idx++)
+      for (int target_idx = 0; target_idx < CHANNEL_TARGETS_MAX; target_idx++)
       {
+        for (int ch_state_idx = 0; ch_state_idx < CHANNEL_STATES_MAX; ch_state_idx++)
         {
-          if (s.ch[i].upstates_ch[j] == 0)
           {
-            break;
+            if (s.ch[channel_idx].target[target_idx].upstates[ch_state_idx] == 0)
+            {
+              break; // no more states in this target
+            }
+            if (s.ch[channel_idx].target[target_idx].upstates[ch_state_idx] >= 1000)
+            {
+              snprintf(state_str_buffer, 8, ",%u,", s.ch[channel_idx].target[target_idx].upstates[ch_state_idx]);
+              Serial.print(state_str_buffer);
+              if (strstr(url_states_part.c_str(), state_str_buffer))
+              {
+                Serial.println(" already in the url");
+              }
+              else
+              {
+                Serial.println("not found in url, adding");
+                url_states_part += String(s.ch[channel_idx].target[target_idx].upstates[ch_state_idx]) + ",";
+              }
+            }
           }
-          url_to_call += String(s.ch[i].upstates_ch[j]) + ",";
         }
       }
-    url_to_call.replace(" ", "");
+    url_states_part.replace(" ", "");
+    url_to_call += url_states_part;
+    Serial.println(url_to_call);
     error = deserializeJson(doc, httpGETRequest(url_to_call.c_str(), pg_state_cache_filename), DeserializationOption::Filter(filter));
   }
 
@@ -641,11 +664,14 @@ const char setup_form_html[] PROGMEM = R"===(<html>
       }
       h3 {margin-block-start: 3em;}
       input {font-size:2em;}
+      
       input[type=checkbox] {width:50px;height:50px;}
       input[type=submit] {margin-top:30px;}
+      .inpnum {text-align: right;}
+      h1,h2,h3 {clear:both;}
       .fld {margin-top: 10px;clear:both;}
       .fldh { width:45%%;margin-right:3%%; }
-      .fldshort {float:left; width:20%%;margin-right:3%%; }
+      .fldshort {float:left; width:20%%;margin-right:3%%;  }   
       .fldlong {float:left; width:70%%;margin-right:3%%; }
     </style>
 </head><body>
@@ -661,49 +687,27 @@ const char setup_form_html[] PROGMEM = R"===(<html>
 <div class="fld"><div>Access password</div><div><input name="http_password" type="text" value="%http_password%"></div></div>
 <div class="fld"><div>Shelly energy meter url</div><div><input name="shelly_url" type="text" value="%shelly_url%"></div></div>
 <div class="fldlong"><div>Fronius address</div><div><input name="fronius_address" type="text" value="%fronius_address%"></div></div>
-<div class="fldshort">Base load (W): <input name="base_load_W" type="text" value="%base_load_W%"></div>
+<div class="fldshort">Base load (W): <input name="base_load_W" class="inpnum" type="text" value="%base_load_W%"></div>
 
 
 
 <div class="fldlong"><div>Powerguru server url</div><div><input name="pg_url" type="text" value="%pg_url%"></div></div>
-<div class="fldshort">Max cache age (s): <input name="pg_cache_age" type="text" value="%pg_cache_age%"></div>
+<div class="fldshort">Max cache age (s): <input class=\"inpnum\" name="pg_cache_age" type="text" value="%pg_cache_age%"></div>
 <br>
 <h2>Status</h2>
 <div class="fld"><div>Current sensor value: %sensorv0%</div></div>
 <div class="fld"><div>Active states: %states%</div></div>
-<p>Refresh to update.</p>
-<h2>uusi</h2>
+<h2>Channels</h2>
 <h3>Channel 1</h3>
 %target_ch_0_0%
 %target_ch_0_1%
 %target_ch_0_2%
+<div class="fldshort">gpio: <input name="gpio_ch0" type="text" value="%gpio_ch0%"></div>
 <h3>Channel 2</h3>
 %target_ch_1_0%
 %target_ch_1_1%
 %target_ch_1_2%
-<h2>Channels</h2>
-<h3>Channel 1</h3>
-<div class="fld"><div>Current status: %up_ch0%</div></div>
-<div class="fldlong"><div>Up on states</div><div><input name="states_ch0" type="text" value="%upstates_ch0%"></div></div>
-<div class="fldshort">Target: <input name="t_u_ch0" type="text" value="%t_u_ch0%"></div>
-
-<div class="fld">Channel options
-<div class="fldshort">Base target: <input name="t_b_ch0" type="text" value="%t_b_ch0%"></div>
-<div class="fldshort"><label for="du_ch0"> default up:</label><br><input type="checkbox"  name="du_ch0" value="du_ch0" %du_ch0%></div>
-<div class="fldshort">gpio: <input name="gpio_ch0" type="text" value="%gpio_ch0%"></div>
-</div>
-
-<h3>Channel 2</h3>
-<div class="fld"><div>Current status: %up_ch1%</div></div>
-<div class="fldlong"><div>Up on states</div><div><input name="states_ch1" type="text" value="%upstates_ch1%"></div></div>
-<div class="fldshort">Target: <input name="t_u_ch1" type="text" value="%t_u_ch1%"></div>
-
-
-<div class="fld">Channel options
-<div class="fldshort">Base target: <input name="t_b_ch1" type="text" value="%t_b_ch1%"></div>
-<div class="fldshort"><label for="du_ch1"> default up:</label><br><input type="checkbox"  name="du_ch1" value="du_ch1" %du_ch1% ></div>
 <div class="fldshort">gpio: <input name="gpio_ch1" type="text" value="%gpio_ch1%"></div>
-</div>
 
 <br><input type="submit" value="Save">  
 </form>
@@ -728,9 +732,11 @@ String state_array_string(uint16_t state_array[CHANNEL_STATES_MAX])
 
 void get_channel_target_fields(char *out, int channel_idx, int target_idx)
 {
-  // char out[400];
+
   String states = state_array_string(s.ch[channel_idx].target[target_idx].upstates);
-  snprintf(out, 400, "<div><div  class=\"fldlong\">#%i priority target<input name=\"st_%i_t%i\" type=\"text\" value=\"%s\"></div></div><div class=\"fldshort\">Target:<input name = \"t_%i_t%i\" type =\"text\" value = \"%f\"></div></div>", target_idx + 1, channel_idx, target_idx, states.c_str(), channel_idx, target_idx, s.ch[channel_idx].target[target_idx].target);
+  char float_buffer[10];
+  dtostrf(s.ch[channel_idx].target[target_idx].target, 3, 1, float_buffer);
+  snprintf(out, 400, "<div><div  class=\"fldlong\">#%i priority target<input name=\"st_%i_t%i\" type=\"text\" value=\"%s\"></div></div><div class=\"fldshort\">Target:<input class=\"inpnum\" name=\"t_%i_t%i\" type=\"text\" value=\"%s\"></div></div>", target_idx + 1, channel_idx, target_idx, states.c_str(), channel_idx, target_idx, float_buffer);
 
   return;
 }
@@ -781,12 +787,6 @@ String setup_form_processor(const String &var)
     char out[400];
     int channel_idx = var.substring(10, 11).toInt();
     int target_idx = var.substring(12, 13).toInt();
-    Serial.print("channel_idx olisko:");
-    Serial.println(var.substring(10, 11));
-    Serial.print("#");
-    Serial.println(var);
-    // var.s
-
     get_channel_target_fields(out, channel_idx, target_idx);
     return out;
   }
@@ -822,24 +822,25 @@ String setup_form_processor(const String &var)
 
   for (int i = 0; i < CHANNELS; i++)
   {
-
-    if (var.equals(String("upstates_ch") + i))
-    {
-      String out;
-      for (int j = 0; j < CHANNEL_STATES_MAX; j++)
-      {
-        if (s.ch[i].upstates_ch[j] == 0)
+    /*
+        if (var.equals(String("upstates_ch") + i))
         {
-          break;
-        }
-        if (j > 0)
-        {
-          out += ",";
-        }
-        out += String(s.ch[i].upstates_ch[j]);
-      }
-      return String(out);
-    }
+          String out;
+          for (int ch_state_idx = 0; ch_state_idx < CHANNEL_STATES_MAX; ch_state_idx++)
+          {
+            if (s.ch[i].upstates_ch[ch_state_idx] == 0)
+            {
+              break;
+            }
+            if (ch_state_idx > 0)
+            {
+              out += ",";
+            }
+            out += String(s.ch[i].upstates_ch[ch_state_idx]);
+          }
+          return String(out);
+        }*/
+    /*
     if (var.equals(String("t_u_ch") + i))
     {
       // return String(target_u_ch[i]);
@@ -850,10 +851,12 @@ String setup_form_processor(const String &var)
       // return String(target_b_ch[i]);
       return String(s.ch[i].target_b_ch);
     }
+    */
     if (var.equals(String("gpio_ch") + i))
     {
       return String(s.ch[i].gpio);
     }
+    /*
     if (var.equals(String("up_ch") + i))
     {
       return String(s.ch[i].is_up ? "up" : "down");
@@ -861,7 +864,7 @@ String setup_form_processor(const String &var)
     if (var.equals(String("du_ch") + i))
     {
       return s.ch[i].default_up ? "checked" : "";
-    }
+    } */
   }
   return String();
 }
@@ -880,49 +883,81 @@ void set_relays()
       break;
   }
 
-  for (int i = 0; i < CHANNELS; i++)
+  for (int channel_idx = 0; channel_idx < CHANNELS; channel_idx++)
   {
     bool any_state_active = false;
-    bool new_up = false;
-    for (int k = 0; k < active_state_count; k++)
-    {
-      for (int j = 0; j < CHANNEL_STATES_MAX; j++)
-      {
-        if (active_states[k] == s.ch[i].upstates_ch[j])
-        {
-          any_state_active = true;
+    bool channel_should_be_up = false;
 
-          // Serial.print(" ,state matches:");
-          // Serial.println(s.ch[i].upstates_ch[j]);
-          //       goto states_clear;
-          break;
+    /*
+        for (int act_state_idx = 0; act_state_idx < active_state_count; act_state_idx++)
+        {
+          for (int ch_state_idx = 0; ch_state_idx < CHANNEL_STATES_MAX; ch_state_idx++)
+          {
+            if (active_states[act_state_idx] == s.ch[channel_idx].upstates_ch[ch_state_idx])
+            {
+              any_state_active = true;
+              break;
+            }
+          }
         }
-      }
-    }
-//  states_clear:
-#ifdef SENSOR_DS18B20
-    if ((any_state_active && ds18B20_temp_c < s.ch[i].target_u_ch) || (!any_state_active && ds18B20_temp_c < s.ch[i].target_b_ch))
+    */
+    // new version
+    // channel/target fields
+
+    for (int target_idx = 0; target_idx < CHANNEL_TARGETS_MAX; target_idx++)
     {
-      new_up = true;
-    }
+      for (int act_state_idx = 0; act_state_idx < active_state_count; act_state_idx++)
+      {
+        for (int ch_state_idx = 0; ch_state_idx < CHANNEL_STATES_MAX; ch_state_idx++)
+        {
+          if (active_states[act_state_idx] == s.ch[channel_idx].target[target_idx].upstates[ch_state_idx])
+          { // tähän target tsekkaus
+            any_state_active = true;
+#ifdef SENSOR_DS18B20
+            if ((ds18B20_temp_c < s.ch[channel_idx].target[target_idx].target))
+            {
+              channel_should_be_up = true;
+            }
 #else
-    new_up = any_state_active;
+            channel_should_be_up = any_state_active;
 #endif
-    if (s.ch[i].is_up != new_up)
+            if (channel_should_be_up)
+              break;
+          }
+        }
+        if (channel_should_be_up)
+          break;
+      }
+      if (channel_should_be_up)
+        break;
+    }
+
+    // end of new version
+
+    //
+    /*
+    #ifdef SENSOR_DS18B20
+        if ((any_state_active && ds18B20_temp_c < s.ch[channel_idx].target_u_ch) || (!any_state_active && ds18B20_temp_c < s.ch[channel_idx].target_b_ch))
+        {
+          channel_should_be_up = true;
+        }
+    #else
+        channel_should_be_up = any_state_active;
+    #endif */
+    if (s.ch[channel_idx].is_up != channel_should_be_up)
     {
       Serial.println();
       Serial.print("channel:");
-      Serial.println(i);
+      Serial.println(channel_idx);
       Serial.print("new relay value:");
-      s.ch[i].is_up = new_up;
-      Serial.print(new_up);
+      s.ch[channel_idx].is_up = channel_should_be_up;
+      Serial.print(channel_should_be_up);
       Serial.print("Setting gpio :");
-      Serial.print(s.ch[i].gpio);
+      Serial.print(s.ch[channel_idx].gpio);
       Serial.print(" ");
-      Serial.println((s.ch[i].is_up ? HIGH : LOW));
-      digitalWrite(s.ch[i].gpio, (s.ch[i].is_up ? HIGH : LOW));
+      Serial.println((s.ch[channel_idx].is_up ? HIGH : LOW));
+      digitalWrite(s.ch[channel_idx].gpio, (s.ch[channel_idx].is_up ? HIGH : LOW));
     }
-
   } // channel loop
 }
 // Web response functions
@@ -982,51 +1017,51 @@ void onWebRootPost(AsyncWebServerRequest *request)
   strcpy(s.pg_url, request->getParam("pg_url", true)->value().c_str());
   s.pg_cache_age = request->getParam("pg_cache_age", true)->value().toInt();
 #endif
-
-  if (request->hasParam("states_ch0", true))
-  {
-
-    // uint16_t upstates_ch[CHANNEL_STATES_MAX];
-    Serial.print("processing:");
-    Serial.println(request->getParam("states_ch0", true)->value().c_str());
-    str_to_uint_array(request->getParam("states_ch0", true)->value().c_str(), s.ch[0].upstates_ch);
-    Serial.print(s.ch[0].upstates_ch[0]);
-    Serial.print("...");
-    Serial.print(s.ch[0].upstates_ch[1]);
-    Serial.println();
-    s.ch[0].gpio = request->getParam("gpio_ch0", true)->value().toInt();
-    s.ch[0].default_up = request->hasParam("du_ch0", true);
-    s.ch[0].target_b_ch = request->getParam("t_b_ch0", true)->value().toFloat();
-    s.ch[0].target_u_ch = request->getParam("t_u_ch0", true)->value().toFloat();
-  }
-  if (request->hasParam("states_ch1", true))
-  {
-    str_to_uint_array(request->getParam("states_ch1", true)->value().c_str(), s.ch[1].upstates_ch);
-    s.ch[1].gpio = request->getParam("gpio_ch1", true)->value().toInt();
-    s.ch[1].default_up = request->hasParam("du_ch1", true);
-    s.ch[1].target_b_ch = request->getParam("t_b_ch1", true)->value().toFloat();
-    s.ch[1].target_u_ch = request->getParam("t_u_ch1", true)->value().toFloat();
-  }
+  /*
+    if (request->hasParam("states_ch0", true))
+    {
+      Serial.print("processing:");
+      Serial.println(request->getParam("states_ch0", true)->value().c_str());
+      str_to_uint_array(request->getParam("states_ch0", true)->value().c_str(), s.ch[0].upstates_ch);
+      Serial.print(s.ch[0].upstates_ch[0]);
+      Serial.print("...");
+      Serial.print(s.ch[0].upstates_ch[1]);
+      Serial.println();
+      s.ch[0].gpio = request->getParam("gpio_ch0", true)->value().toInt();
+      s.ch[0].default_up = request->hasParam("du_ch0", true);
+      s.ch[0].target_b_ch = request->getParam("t_b_ch0", true)->value().toFloat();
+      s.ch[0].target_u_ch = request->getParam("t_u_ch0", true)->value().toFloat();
+    }
+    if (request->hasParam("states_ch1", true))
+    {
+      str_to_uint_array(request->getParam("states_ch1", true)->value().c_str(), s.ch[1].upstates_ch);
+      s.ch[1].gpio = request->getParam("gpio_ch1", true)->value().toInt();
+      s.ch[1].default_up = request->hasParam("du_ch1", true);
+      s.ch[1].target_b_ch = request->getParam("t_b_ch1", true)->value().toFloat();
+      s.ch[1].target_u_ch = request->getParam("t_u_ch1", true)->value().toFloat();
+    }
+  */
+  // channel/target fields
+  char gpio_fld[9];
   char state_fld[8];
   char target_fld[7];
   for (int channel_idx = 0; channel_idx < CHANNELS; channel_idx++)
   {
+    snprintf(gpio_fld, 9, "gpio_ch%i", channel_idx);
+    s.ch[channel_idx].gpio = request->getParam(gpio_fld, true)->value().toInt();
+
     for (int target_idx = 0; target_idx < CHANNEL_TARGETS_MAX; target_idx++)
     {
       snprintf(state_fld, 8, "st_%i_t%i", channel_idx, target_idx);
       snprintf(target_fld, 7, "t_%i_t%i", channel_idx, target_idx);
       if (request->hasParam(state_fld, true))
-      { Serial.print("ON:");
-        Serial.println(state_fld);
+      {
         str_to_uint_array(request->getParam(state_fld, true)->value().c_str(), s.ch[channel_idx].target[target_idx].upstates);
         s.ch[channel_idx].target[target_idx].target = request->getParam(target_fld, true)->value().toFloat();
       }
-      else {
-        Serial.print("EI OO:");
-        Serial.println(state_fld);
-      }
     }
   }
+
   // save to non-volatile memory
   writeToEEPROM();
 
@@ -1118,8 +1153,8 @@ void setup()
     // strcpy(s.shelly_url, "http://192.168.66.40/status");
 #endif
 
-    s.ch[0] = {{10101}, 20, 80, false, false, 14U}; // D5=GPIO14 , D1	GPIO5
-    s.ch[1] = {{10102}, 21, 81, false, false, 12U}; // D6=GPIO12, D3	GPIO0
+    // s.ch[0] = {{10101}, 20, 80, false, false, 14U}; // D5=GPIO14 , D1	GPIO5
+    // s.ch[1] = {{10102}, 21, 81, false, false, 12U}; // D6=GPIO12, D3	GPIO0
     writeToEEPROM();
   }
 
@@ -1273,18 +1308,6 @@ void loop()
     sensor_last_refresh = millis();
     set_relays(); // tässä voisi katsoa onko tarvetta mennä tähän eli onko tullut muutosta
   }
-  /*
-  #ifdef QUERY_POWERGURU
-    if (((millis() - powerguru_last_refresh) > powerguru_interval_s * 1000) or period_changed)
-    {
-      // Serial.println(F("Calling refresh_states"));
-      refresh_states(current_period_start);
-      powerguru_last_refresh = millis();
-    }
-  #endif
-  */
-
-  set_relays(); // tässä voisi katsoa onko tarvetta mennä tähän eli onko tullut muutosta
 
   if (period_changed)
   {
