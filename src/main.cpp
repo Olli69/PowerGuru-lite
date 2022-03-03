@@ -20,6 +20,9 @@
 #define INVERTER_FRONIUS_SOLARAPI
 #define TARIFF_STATES_FI // add Finnish tariffs (yösähkö,kausisähkö) to active states
 
+#define ENABLE_OTA_UPDATE
+
+
 #define RTCMEMORYSTART 65
 #define eepromaddr 0
 #define WATT_EPSILON 50
@@ -48,15 +51,22 @@ tm tm;
 #define MY_TZ "EET-2EEST,M3.5.0/3,M10.5.0/4"
 
 // DNSServer dnsServer;
-AsyncWebServer server(80);
+AsyncWebServer server_web(80);
 
 // client
 #include <ESP8266HTTPClient.h>
 #include <WiFiClient.h>
-// # include <Arduino_JSON.h>
 #include <ArduinoJson.h>
 
 // Non-volatile memory https://github.com/CuriousTech/ESP-HVAC/blob/master/Arduino/eeMem.cpp
+
+#ifdef ENABLE_OTA_UPDATE
+unsigned long server_ota_started;
+
+#include <AsyncElegantOTA.h>
+AsyncWebServer server_OTA(80);
+
+#endif 
 
 #ifdef SENSOR_DS18B20
 // see: https://randomnerdtutorials.com/esp8266-ds18b20-temperature-sensor-web-server-with-arduino-ide/
@@ -90,12 +100,6 @@ unsigned shelly3em_interval_s = 30;
 // all read operations at once
 unsigned sensor_read_interval_s = 30;
 unsigned long sensor_last_refresh = -sensor_read_interval_s * 1000; // start reading as soon as you get to first loop
-
-//  the following variables are unsigned longs because the time, measured in
-//  milliseconds, will quickly become a bigger number than can be stored in an int.
-// Timer set to 10 minutes (600000)
-// unsigned long timerDelay = 600000;
-// Set timer to 5 seconds (5000)
 
 const unsigned long netting_period_min = 60; // should be 60
 unsigned long recording_period_start = 0;    // first period: boot time, later period starts
@@ -151,6 +155,9 @@ typedef struct
 #ifdef INVERTER_FRONIUS_SOLARAPI
   char fronius_address[MAX_URL_STR_LENGTH];
   uint32_t base_load_W; // production above base load is "free" to use/store
+#endif
+#ifdef ENABLE_OTA_UPDATE
+  bool next_boot_ota_update;
 #endif
 } settings_struct;
 
@@ -537,6 +544,7 @@ byte get_internal_states(uint16_t state_array[CHANNEL_STATES_MAX])
 #endif
 
 #ifdef INVERTER_FRONIUS_SOLARAPI
+//TODO: tsekkaa miksi joskus nousee ylös lyhyeksi aikaa vaikkei pitäisi
   if (power_produced_period_avg > (s.base_load_W + WATT_EPSILON)) //"extra" energy produced, more than estimated base load
     state_array[idx++] = 1003;
 #endif
@@ -662,7 +670,7 @@ const char setup_form_html[] PROGMEM = R"===(<html>
       form, #fld, input{
         width:100%%;
       }
-      h3 {margin-block-start: 3em;}
+      h3 {margin-block-start: 2em;}
       input {font-size:2em;}
       
       input[type=checkbox] {width:50px;height:50px;}
@@ -677,7 +685,7 @@ const char setup_form_html[] PROGMEM = R"===(<html>
 </head><body>
 <form method="post">
 
-<div class="fld">Wifi</div>
+<div class="fld">WiFi</div>
 <div class="fld"><input type="checkbox" id="sta_mode" name="sta_mode" value="sta_mode" %sta_mode%><label for="sta_mode"> Connect to existing wifi network</label></div>
 
 <div class="fld"><div>Wifi SSID</div><div><input name="wifi_ssid" type="text" value="%wifi_ssid%"></div></div>
@@ -692,22 +700,25 @@ const char setup_form_html[] PROGMEM = R"===(<html>
 
 
 <div class="fldlong"><div>Powerguru server url</div><div><input name="pg_url" type="text" value="%pg_url%"></div></div>
-<div class="fldshort">Max cache age (s): <input class=\"inpnum\" name="pg_cache_age" type="text" value="%pg_cache_age%"></div>
+<div class="fldshort">Max cache age (s): <input class="inpnum" name="pg_cache_age" type="text" value="%pg_cache_age%"></div>
 <br>
 <h2>Status</h2>
 <div class="fld"><div>Current sensor value: %sensorv0%</div></div>
 <div class="fld"><div>Active states: %states%</div></div>
-<h2>Channels</h2>
-<h3>Channel 1</h3>
+<div class="fld"><h3>Channel 1</h3></div>
+<div class="fld"><div>Current status: %up_ch0%</div></div>
 %target_ch_0_0%
 %target_ch_0_1%
 %target_ch_0_2%
 <div class="fldshort">gpio: <input name="gpio_ch0" type="text" value="%gpio_ch0%"></div>
-<h3>Channel 2</h3>
+<div class="fld"><h3>Channel 2</h3></div>
+<div class="fld"><div>Current status: %up_ch1%</div></div>
 %target_ch_1_0%
 %target_ch_1_1%
 %target_ch_1_2%
 <div class="fldshort">gpio: <input name="gpio_ch1" type="text" value="%gpio_ch1%"></div>
+<div class="fld"><input type="checkbox" id="ota_next" name="ota_next" value="ota_next"><label for="ota_next">Prepare for update.</label></div>
+
 
 <br><input type="submit" value="Save">  
 </form>
@@ -856,12 +867,14 @@ String setup_form_processor(const String &var)
     {
       return String(s.ch[i].gpio);
     }
-    /*
+    
     if (var.equals(String("up_ch") + i))
     {
+      Serial.print("###");
+      Serial.println(var);
       return String(s.ch[i].is_up ? "up" : "down");
     }
-    if (var.equals(String("du_ch") + i))
+  /*  if (var.equals(String("du_ch") + i))
     {
       return s.ch[i].default_up ? "checked" : "";
     } */
@@ -874,6 +887,9 @@ String setup_form_processor(const String &var)
 void set_relays()
 {
   int active_state_count = 0;
+  bool any_state_active = false;
+  bool channel_should_be_up = false;
+
   // how many current active states we do have
   for (int i = 0; i < CHANNEL_STATES_MAX; i++)
   {
@@ -885,8 +901,7 @@ void set_relays()
 
   for (int channel_idx = 0; channel_idx < CHANNELS; channel_idx++)
   {
-    bool any_state_active = false;
-    bool channel_should_be_up = false;
+
 
     /*
         for (int act_state_idx = 0; act_state_idx < active_state_count; act_state_idx++)
@@ -955,8 +970,14 @@ void set_relays()
       Serial.print("Setting gpio :");
       Serial.print(s.ch[channel_idx].gpio);
       Serial.print(" ");
-      Serial.println((s.ch[channel_idx].is_up ? HIGH : LOW));
+      Serial.println((s.ch[channel_idx].is_up ? "HIGH" : "LOW"));
       digitalWrite(s.ch[channel_idx].gpio, (s.ch[channel_idx].is_up ? HIGH : LOW));
+    }
+    else {
+      Serial.print("channel ");
+      Serial.print(channel_idx);
+      Serial.print(": ");
+      Serial.println(s.ch[channel_idx].is_up );
     }
   } // channel loop
 }
@@ -989,6 +1010,7 @@ void onWebResetGet(AsyncWebServerRequest *request)
   writeToEEPROM();
   delay(1000);
   ESP.restart();
+  
 }
 
 void onWebRootPost(AsyncWebServerRequest *request)
@@ -997,6 +1019,7 @@ void onWebRootPost(AsyncWebServerRequest *request)
   int paramsNr = request->params();
   Serial.println(paramsNr);
   // s.sta_mode = request->getParam("sta_mode", true)->value().
+
 
   s.sta_mode = request->hasParam("sta_mode", true);
   Serial.print("s.sta_mode:");
@@ -1061,7 +1084,17 @@ void onWebRootPost(AsyncWebServerRequest *request)
       }
     }
   }
+  
+#ifdef ENABLE_OTA_UPDATE
+  if (request->hasParam("ota_next", true)) {
+     s.next_boot_ota_update = true;
+      writeToEEPROM();
+      request->redirect("/update");
+      delay(1000); 
+      ESP.restart(); // ei taida tulla vastausta
+  }
 
+#endif
   // save to non-volatile memory
   writeToEEPROM();
 
@@ -1161,12 +1194,13 @@ void setup()
   for (int i = 0; i < CHANNELS; i++)
   {
     Serial.print(F("Setting gpio "));
-    Serial.println(s.ch[i].gpio);
+    Serial.print(s.ch[i].gpio);
     pinMode(s.ch[i].gpio, OUTPUT);
     // if up/down up-to-date stored to non-volatile:
     // digitalWrite(s.ch[i].gpio, (s.ch[i].is_up ? HIGH : LOW));
     //  use defaults
-    digitalWrite(s.ch[i].gpio, (s.ch[i].default_up ? HIGH : LOW));
+    digitalWrite(s.ch[i].gpio, (s.ch[i].is_up ? HIGH : LOW));
+    Serial.println((s.ch[i].is_up ? "HIGH" : "LOW"));
   }
   /*
     if (1 == 2) //Softap should be created if cannot connect to wifi (like in init), redirect
@@ -1211,7 +1245,7 @@ void setup()
       Serial.println(WiFi.softAPIP().toString());
       // dnsServer.start(53, "*", WiFi.softAPIP());
 
-      // server.on(new CaptiveRequestHandler()).setFilter(ON_AP_FILTER,)
+      // server_web.on(new CaptiveRequestHandler()).setFilter(ON_AP_FILTER,)
     }
     else
     {
@@ -1220,23 +1254,45 @@ void setup()
     }
   }
 
+#ifdef ENABLE_OTA_UPDATE
+  // wait for update
+  if (s.next_boot_ota_update)
+  {
+    // server_web.end();
+    s.next_boot_ota_update = false; // next boot is normal
+    writeToEEPROM();
+
+    server_OTA.on("/", HTTP_GET, [](AsyncWebServerRequest *request)
+                  { request->send(200, "text/html", "<html><body><a href=\"/update\">update</a> | <a href=\"/restart\">restart</a></body></html>"); });
+
+    server_OTA.on("/restart", HTTP_GET, [](AsyncWebServerRequest *request)
+                  { ESP.restart(); });
+    AsyncElegantOTA.begin(&server_OTA); // Start ElegantOTA
+    server_ota_started = millis();
+    server_OTA.begin(); // tähän joku timeout
+    delay(600000);
+    ESP.restart();
+  }
+#endif
+
+
   // TODO: prepare for no internet connection? -> channel defaults probably, RTC?
   // https://werner.rothschopf.net/202011_arduino_esp8266_ntp_en.htm
   configTime(MY_TZ, MY_NTP_SERVER); // --> Here is the IMPORTANT ONE LINER needed in your sketch!
 
-  server.on("/reset", HTTP_GET, onWebResetGet);
-  server.on("/status", HTTP_GET, onWebStatusGet);
-  server.on("/", HTTP_GET, onWebRootGet);
-  server.on("/", HTTP_POST, onWebRootPost);
+  server_web.on("/reset", HTTP_GET, onWebResetGet);
+  server_web.on("/status", HTTP_GET, onWebStatusGet);
+  server_web.on("/", HTTP_GET, onWebRootGet);
+  server_web.on("/", HTTP_POST, onWebRootPost);
 
   /* if (create_ap) {
-     server.addHandler(new CaptiveRequestHandler()).setFilter(ON_AP_FILTER);//only when requested from AP
+     server_web.addHandler(new CaptiveRequestHandler()).setFilter(ON_AP_FILTER);//only when requested from AP
    }
    */
 
-  server.onNotFound(notFound);
+  server_web.onNotFound(notFound);
 
-  server.begin();
+  server_web.begin();
 
   Serial.print(F("setup() finished:"));
   Serial.println(ESP.getFreeHeap());
@@ -1259,6 +1315,9 @@ void setup()
 
   Serial.print("started:");
   Serial.println(started);
+
+
+
 
 } // end of setup()
 
@@ -1287,7 +1346,7 @@ void loop()
 
   if (WiFi.waitForConnectResult() != WL_CONNECTED)
   {
-    delay(5000);
+    delay(1000);
     return;
   }
 
@@ -1307,6 +1366,7 @@ void loop()
     refresh_states(current_period_start);
     sensor_last_refresh = millis();
     set_relays(); // tässä voisi katsoa onko tarvetta mennä tähän eli onko tullut muutosta
+
   }
 
   if (period_changed)
@@ -1315,5 +1375,8 @@ void loop()
     period_changed = false;
   }
 
-  delay(5000);
+
+  
+
+ // delay(5000);
 }
