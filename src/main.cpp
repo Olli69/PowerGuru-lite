@@ -18,6 +18,8 @@
 #define METER_SHELLY3EM
 #define SENSOR_DS18B20
 #define INVERTER_FRONIUS_SOLARAPI
+#define INVERTER_SMA_MODBUS
+
 #define TARIFF_STATES_FI // add Finnish tariffs (yösähkö,kausisähkö) to active states
 
 #define ENABLE_OTA_UPDATE
@@ -59,6 +61,9 @@ AsyncWebServer server_web(80);
 #include <ArduinoJson.h>
 
 // Non-volatile memory https://github.com/CuriousTech/ESP-HVAC/blob/master/Arduino/eeMem.cpp
+#ifdef INVERTER_SMA_MODBUS
+#include <ModbusIP_ESP8266.h>
+#endif
 
 #ifdef ENABLE_OTA_UPDATE
 unsigned long server_ota_started;
@@ -115,7 +120,18 @@ bool period_changed = false;
 
 #define MAX_ID_STR_LENGTH 30
 #define MAX_URL_STR_LENGTH 70
-// nämä flashiin, voisiko olla array of unsigned int 0-65k
+
+#define ENERGYM_NONE 0
+#define ENERGYM_SHELLY3EM 1
+#define ENERGYM_FRONIUS_SOLAR 2
+#define ENERGYM_SMA_MODBUS_TCP 3
+#define ENERGYM_MAX 3
+
+const char * energym_strings[] PROGMEM = {"none", "Shelly 3EM","Fronius Solar API","SMA Modbus TCP"};
+
+int SMA_DAYENERGY_OFFSET = 30535; 
+int SMA_POWER_OFFSET = 30775; 
+
 
 // uusi tapa, under construction
 typedef struct
@@ -145,29 +161,35 @@ typedef struct
   char http_password[MAX_ID_STR_LENGTH];
   channel_struct ch[CHANNELS];
 #ifdef QUERY_POWERGURU
-  char pg_url[MAX_URL_STR_LENGTH];
+ // char pg_url[MAX_URL_STR_LENGTH]; //tämän voisi muuttaa host-muotoon, porttia ei tarvitse kai splitata
+  char pg_host[MAX_ID_STR_LENGTH];
+  unsigned int pg_port;
   uint16_t pg_cache_age;
   // uint16_t pg_refresh_interval;
 #endif
 #ifdef METER_SHELLY3EM
-  char shelly_url[MAX_URL_STR_LENGTH];
+ // char shelly_url[MAX_URL_STR_LENGTH];
 #endif
 #ifdef INVERTER_FRONIUS_SOLARAPI
-  char fronius_address[MAX_URL_STR_LENGTH];
+//  char fronius_address[MAX_URL_STR_LENGTH];
   uint32_t base_load_W; // production above base load is "free" to use/store
 #endif
 #ifdef ENABLE_OTA_UPDATE
   bool next_boot_ota_update;
 #endif
+  byte energy_meter_type;
+  char energy_meter_host[MAX_ID_STR_LENGTH];
+  unsigned int energy_meter_port;
+  byte energy_meter_id;
 } settings_struct;
 
 settings_struct s;
 
 uint16_t active_states[ACTIVE_STATES_MAX];
 
-void str_to_uint_array(const char *str_in, uint16_t array_out[CHANNEL_STATES_MAX])
+void str_to_uint_array(const char *str_in, uint16_t array_out[CHANNEL_STATES_MAX], char *separator)
 {
-  char *ptr = strtok((char *)str_in, ",");
+  char *ptr = strtok((char *)str_in, separator);
   byte i = 0;
 
   for (int ch_state_idx = 0; ch_state_idx < CHANNEL_STATES_MAX; ch_state_idx++)
@@ -312,14 +334,17 @@ float energyout = 0;
 
 void read_meter_shelly3em()
 {
-  if (strlen(s.shelly_url) == 0)
+  if (strlen(s.energy_meter_host) == 0)
     return;
   // Serial.print(F("Starting to read Shelly"));
   DynamicJsonDocument doc(2048); // oli 1536
 
   // sensorReadings = ;
+//  DeserializationError error = deserializeJson(doc, httpGETRequest(s.shelly_url, ""));
+  String url = "http://" + String(s.energy_meter_host) + ":" +  String(s.energy_meter_port)  + "/status";
+  DeserializationError error = deserializeJson(doc, httpGETRequest(url.c_str(), ""));
+  Serial.println(url);
 
-  DeserializationError error = deserializeJson(doc, httpGETRequest(s.shelly_url, ""));
   if (error)
   {
     Serial.print(F("Shelly meter deserializeJson() failed: "));
@@ -378,7 +403,7 @@ long unsigned int power_produced_period_avg = 0;
 
 void read_inverter_fronius()
 {
-  if (strlen(s.fronius_address) == 0)
+  if (strlen(s.energy_meter_host) == 0)
     return;
 
   time(&now);
@@ -389,8 +414,9 @@ void read_inverter_fronius()
   filter_Body_Data["PAC"] = true;
 
   StaticJsonDocument<256> doc;
-  String inverter_url = String(s.fronius_address) + "/solar_api/v1/GetInverterRealtimeData.cgi?scope=Device&DeviceId=1&DataCollection=CumulationInverterData";
-  // Serial.println(inverter_url);
+ // String inverter_url = String(s.fronius_address) + "/solar_api/v1/GetInverterRealtimeData.cgi?scope=Device&DeviceId=1&DataCollection=CumulationInverterData";
+  String inverter_url = "http://" + String(s.energy_meter_host) + ":" +  String(s.energy_meter_port)  + "/solar_api/v1/GetInverterRealtimeData.cgi?scope=Device&DeviceId=1&DataCollection=CumulationInverterData";
+  Serial.println(inverter_url);
 
   DeserializationError error = deserializeJson(doc, httpGETRequest(inverter_url.c_str(), ""), DeserializationOption::Filter(filter));
 
@@ -432,12 +458,7 @@ void read_inverter_fronius()
   energy_produced_period = total_energy - inverter_total_period_init;
 
   long int time_since_recording_period_start = now - recording_period_start;
-  /*
-    Serial.print("now:");
-    Serial.println(now);
-    Serial.print("recording_period_start:");
-    Serial.println(recording_period_start);
-    */
+
 
   if (time_since_recording_period_start > 60) // in the beginning of period use current power, 60 is  an estimate
     power_produced_period_avg = energy_produced_period * 3600 / time_since_recording_period_start;
@@ -445,8 +466,113 @@ void read_inverter_fronius()
     power_produced_period_avg = current_power;
 
   Serial.printf("energy_produced_period: %ld , time_since_recording_period_start: %ld , power_produced_period_avg: %ld \n", energy_produced_period, time_since_recording_period_start, power_produced_period_avg);
-}
+} //read_inverter_fronius
+
 #endif
+
+#ifdef INVERTER_SMA_MODBUS
+
+ModbusIP mb;  //ModbusIP object
+#define REG_COUNT 2
+uint16_t buf[REG_COUNT];
+uint16_t trans;
+//IPAddress remote(84,231,164,210); 
+//IPAddress remote(); 
+
+bool cb(Modbus::ResultCode event, uint16_t transactionId, void* data) { // Callback to monitor errors
+  if (event != Modbus::EX_SUCCESS) {
+    if (event == Modbus::EX_TIMEOUT) {
+      Serial.println("EX_TIMEOUT");
+    } 
+    else {
+      Serial.print("Request result: 0x");
+      Serial.println(event, HEX);
+    }
+  //  mb.disconnect( remote);
+  }
+  
+  return true;
+}
+
+long int get_mbus_value(IPAddress remote, int reg_offset,uint16_t reg_num, uint8_t modbusip_unit) {
+   long int combined;
+   uint16_t trans = mb.readHreg(remote, reg_offset, buf, reg_num, cb, modbusip_unit);
+  
+  
+   while (mb.isTransaction(trans))
+   { // Check if transaction is active
+     mb.task();
+     delay(10);
+   }
+    if (reg_num ==1) {
+      combined = buf[0];
+    }
+    else if (reg_num ==2){
+      combined = buf[0]*(65536)+buf[1]; 
+    }
+    else {
+      combined = 0;
+    }
+    return combined;
+}
+
+
+void read_inverter_sma() {
+
+  long int alku = millis();
+  //IPAddress remote(); // veikkola.duckdns.org 84.231.164.210
+  //IPAddress remote(84,231,164,210);
+  //remote.fromString(s.energy_meter_host);
+  //tässä voisi olla ip
+  uint16_t ip_octets[CHANNEL_STATES_MAX];
+  str_to_uint_array(s.energy_meter_host, ip_octets,".");
+  IPAddress remote(ip_octets[0],ip_octets[1],ip_octets[2],ip_octets[3]);
+  Serial.print("Parsed IP: ");
+  Serial.print(ip_octets[0]);
+  Serial.print(".");
+  Serial.print(ip_octets[1]);
+  Serial.print(".");
+  Serial.print(ip_octets[2]);
+  Serial.print(".");
+  Serial.print(ip_octets[3]);
+  
+
+  uint16_t ip_port = s.energy_meter_port;
+  uint8_t modbusip_unit = s.energy_meter_id;
+
+  ModbusIP mb;  //ModbusIP object
+
+  if (!mb.isConnected(remote)) {
+     Serial.print("Connecting");
+    bool cresult = mb.connect(remote,ip_port); 
+    Serial.println(cresult);
+  }
+
+  if (mb.isConnected(remote) ) {   // Check if connection to Modbus Slave is established
+    Serial.print(" Day energy Wh:");
+    Serial.println(get_mbus_value(remote,SMA_DAYENERGY_OFFSET,2,modbusip_unit));
+
+    Serial.print(" Current power W:");
+    Serial.println(get_mbus_value(remote,SMA_POWER_OFFSET,2,modbusip_unit));
+
+    Serial.print("kesti:");
+    Serial.println(millis()-alku);
+    Serial.println();
+  }
+  else 
+    { Serial.println("NOT CONNECTED");} 
+
+  mb.disconnect( remote);
+ /*
+   for (int i = 0; i< 3000;i++) {
+      mb.task();
+      delay(10);
+    } */
+
+} //read_inverter_sma
+#endif
+
+
 
 #ifdef QUERY_POWERGURU
 bool is_cache_file_valid(const char *cache_file_name, unsigned long max_age_sec)
@@ -559,7 +685,7 @@ void refresh_states(unsigned long current_period_start)
 #ifndef QUERY_POWERGURU
   return; // fucntionality disabled
 #endif
-  if (strlen(s.pg_url) == 0)
+  if (strlen(s.pg_host) == 0)
     return;
 
   time(&now);
@@ -592,8 +718,9 @@ void refresh_states(unsigned long current_period_start)
     // Stream& input;
     // TODO: save to a file and use filter with the cached json
 
-    // StaticJsonDocument<400> doc;
-    String url_to_call = String(s.pg_url) + "&states=";
+    
+   // String url_to_call = String(s.pg_url) + "&states=";
+    String url_to_call = "http://" + String(s.pg_host) + ":" + String(s.pg_port)+  "&states=";
     String url_states_part = ",";
     char state_str_buffer[8];
     // char *ptr = 0;
@@ -672,36 +799,67 @@ const char setup_form_html[] PROGMEM = R"===(<html>
       }
       h3 {margin-block-start: 2em;}
       input {font-size:2em;}
-      
       input[type=checkbox] {width:50px;height:50px;}
       input[type=submit] {margin-top:30px;}
       .inpnum {text-align: right;}
       h1,h2,h3 {clear:both;}
       .fld {margin-top: 10px;clear:both;}
-      .fldh { width:45%%;margin-right:3%%; }
-      .fldshort {float:left; width:20%%;margin-right:3%%;  }   
-      .fldlong {float:left; width:70%%;margin-right:3%%; }
+      .fldh { float:left; width:44%%; margin-right:2%%; }
+      .fldshort {float:left; width:20%%;margin-right:2%%; }   
+      .fldtiny {float:left; width:17%%;margin-right:2%%;  }
+      .fldlong {float:left; width:70%%;margin-right:2%%; }
     </style>
-</head><body>
-<form method="post">
+</head>
+<body onload="emtChanged(%emt%);">
+<script>
+function emtChanged(val) {
+  idx = parseInt(val);
+ // alert("The input value has changed. The new value is: " + val + "  " + [1,2,3].indexOf(idx));
+  var emhd =  document.querySelector('#emhd');
+  var empd =  document.querySelector('#empd');
+  var emidd =  document.querySelector('#emidd');
+  var baseld =  document.querySelector('#baseld');
+ 
+  if ([1,2,3].indexOf(idx) > -1) {
+    emhd.style.display = "block";
+    empd.style.display = "block";
+  }
+  else {
+    emhd.style.display = "none";
+    empd.style.display = "none";
+    }
+  if ([2,3].indexOf(idx) > -1) 
+    baseld.style.display = "block";
+  else
+    baseld.style.display = "none";
 
+  if ([3].indexOf(idx) > -1) 
+    emidd.style.display = "block";
+  else
+    emidd.style.display = "none";
+}
+
+</script>
+<form method="post">
 <div class="fld">WiFi</div>
 <div class="fld"><input type="checkbox" id="sta_mode" name="sta_mode" value="sta_mode" %sta_mode%><label for="sta_mode"> Connect to existing wifi network</label></div>
-
 <div class="fld"><div>Wifi SSID</div><div><input name="wifi_ssid" type="text" value="%wifi_ssid%"></div></div>
-<div class="fld"><div>Wifi password</div><div><input name="wifi_password"  type="text" value="%wifi_password%"></div></div>
+<div class="fld"><div>Wifi password</div><div><input name="wifi_password"  type="password" value="%wifi_password%"></div></div>
 <div class="fld"><div>Access uid</div><div><input  name="http_username"  type="text" value="%http_username%" readonly></div></div>
 
-<div class="fld"><div>Access password</div><div><input name="http_password" type="text" value="%http_password%"></div></div>
-<div class="fld"><div>Shelly energy meter url</div><div><input name="shelly_url" type="text" value="%shelly_url%"></div></div>
-<div class="fldlong"><div>Fronius address</div><div><input name="fronius_address" type="text" value="%fronius_address%"></div></div>
-<div class="fldshort">Base load (W): <input name="base_load_W" class="inpnum" type="text" value="%base_load_W%"></div>
+<div class="fld"><div>Access password</div><div><input name="http_password" type="password" value="%http_password%"></div></div>
 
+<div class="fld">
+<div class="fldh">host:<input name="pg_host" type="text" value="%pg_host%"></div>
+<div class="fldtiny">port:<input name="pg_port" type="text" value="%pg_port%"></div>
+<div class="fldshort">Max cache age:<input class="inpnum" name="pg_cache_age" type="text" value="%pg_cache_age%"></div>
+</div>
 
-
-<div class="fldlong"><div>Powerguru server url</div><div><input name="pg_url" type="text" value="%pg_url%"></div></div>
-<div class="fldshort">Max cache age (s): <input class="inpnum" name="pg_cache_age" type="text" value="%pg_cache_age%"></div>
 <br>
+%energy_meter_fields%
+
+<div class="fldshort" id="baseld">base load (W):<input name="base_load_W" class="inpnum" type="text" value="%base_load_W%"></div>
+
 <h2>Status</h2>
 <div class="fld"><div>Current sensor value: %sensorv0%</div></div>
 <div class="fld"><div>Active states: %states%</div></div>
@@ -743,7 +901,6 @@ String state_array_string(uint16_t state_array[CHANNEL_STATES_MAX])
 
 void get_channel_target_fields(char *out, int channel_idx, int target_idx)
 {
-
   String states = state_array_string(s.ch[channel_idx].target[target_idx].upstates);
   char float_buffer[10];
   dtostrf(s.ch[channel_idx].target[target_idx].target, 3, 1, float_buffer);
@@ -751,10 +908,30 @@ void get_channel_target_fields(char *out, int channel_idx, int target_idx)
 
   return;
 }
+void get_meter_config_fields(char *out) {
+
+  char buff[120];
+  strcpy(out, "<div class=\"fld\"><select name=\"emt\" id=\"emt\" onchange=\"emtChanged(this.value)\">");
+
+  for (int energym_idx = 0; energym_idx <= ENERGYM_MAX; energym_idx++)
+  {
+    snprintf(buff, 100, "<option value=\"%d\" %s>%s</>", energym_idx, (s.energy_meter_type == energym_idx) ? "selected" : "", energym_strings[energym_idx]);
+    strcat(out,buff);
+ }
+strcat(out,"</select></div>");
+
+snprintf(buff, 120, "<div id='emhd' class=\"fld\"><div class=\"fldh\">host:<input name=\"emh\" id=\"emh\" type=\"text\" value=\"%s\"></div>",s.energy_meter_host);
+strcat(out,buff);
+snprintf(buff, 120, "<div id='empd' class=\"fldtiny\">port:<input name=\"emp\" id=\"emp\" type=\"text\" value=\"%d\"></div>",s.energy_meter_port);
+strcat(out,buff);
+snprintf(buff, 120, "<div id='emidd' class=\"fldtiny\">unit:<input name=\"emid\" id=\"emid\" type=\"text\" value=\"%d\"></div></div>",s.energy_meter_id);
+strcat(out,buff);
+//Serial.println(out);
+return;
+}
 
 String setup_form_processor(const String &var)
 {
-
   if (var == "sta_mode")
     return s.sta_mode ? "checked" : "";
   if (var == "wifi_ssid")
@@ -762,22 +939,19 @@ String setup_form_processor(const String &var)
   if (var == "wifi_password")
     return s.wifi_password;
   if (var == "http_username")
-    // return s.http_username;
     return F("powerguru");
   if (var == "http_password")
     return s.http_password;
 
-#ifdef METER_SHELLY3EM
-  if (var == "shelly_url")
-    return s.shelly_url;
-#endif
+  if (var == "emt")
+    return String(s.energy_meter_type);
 
-  if (var == "fronius_address")
-#ifdef INVERTER_FRONIUS_SOLARAPI
-    return s.fronius_address;
-#else
-    return F("(disabled)")
-#endif
+  if (var == "energy_meter_fields") {
+       char out[600];
+      get_meter_config_fields(out);
+      return out; 
+  }
+
 
   if (var == "base_load_W")
 #ifdef INVERTER_FRONIUS_SOLARAPI
@@ -790,7 +964,7 @@ String setup_form_processor(const String &var)
 #ifdef SENSOR_DS18B20
     return String(ds18B20_temp_c);
 #else
-                    return F("not in use");
+    return F("not in use");
 #endif
   if (var.startsWith("target_ch_"))
   {
@@ -803,27 +977,16 @@ String setup_form_processor(const String &var)
   }
   if (var == "states")
   {
-    // char out[400];
-    // char[CHANNEL_STATES_MAX * 6 + 1];
     return state_array_string(active_states);
-    /*
-    String states = String();
-    for (int i = 0; i < CHANNEL_STATES_MAX; i++)
-    {
-      if (active_states[i] > 0) {
-        states += String(active_states[i]);
-        if (i+1 <CHANNEL_STATES_MAX && (active_states[i+1] > 0) )
-          states += String(",");
-        }
-      else
-        break;
-    }
-    return states;*/
   }
 
 #ifdef QUERY_POWERGURU
-  if (var == "pg_url")
-    return s.pg_url;
+  /*if (var == "pg_url")
+    return s.pg_url;*/
+  if (var == "pg_host")
+    return s.pg_host;
+  if (var == "pg_port")
+    return String(s.pg_port);
   if (var == "pg_cache_age")
     return String(s.pg_cache_age);
 
@@ -833,36 +996,6 @@ String setup_form_processor(const String &var)
 
   for (int i = 0; i < CHANNELS; i++)
   {
-    /*
-        if (var.equals(String("upstates_ch") + i))
-        {
-          String out;
-          for (int ch_state_idx = 0; ch_state_idx < CHANNEL_STATES_MAX; ch_state_idx++)
-          {
-            if (s.ch[i].upstates_ch[ch_state_idx] == 0)
-            {
-              break;
-            }
-            if (ch_state_idx > 0)
-            {
-              out += ",";
-            }
-            out += String(s.ch[i].upstates_ch[ch_state_idx]);
-          }
-          return String(out);
-        }*/
-    /*
-    if (var.equals(String("t_u_ch") + i))
-    {
-      // return String(target_u_ch[i]);
-      return String(s.ch[i].target_u_ch);
-    }
-    if (var.equals(String("t_b_ch") + i))
-    {
-      // return String(target_b_ch[i]);
-      return String(s.ch[i].target_b_ch);
-    }
-    */
     if (var.equals(String("gpio_ch") + i))
     {
       return String(s.ch[i].gpio);
@@ -874,15 +1007,31 @@ String setup_form_processor(const String &var)
       Serial.println(var);
       return String(s.ch[i].is_up ? "up" : "down");
     }
-  /*  if (var.equals(String("du_ch") + i))
-    {
-      return s.ch[i].default_up ? "checked" : "";
-    } */
   }
   return String();
 }
 
 // ...
+
+
+void read_energy_meter() {
+  if (s.energy_meter_type == ENERGYM_SHELLY3EM) {
+#ifdef METER_SHELLY3EM
+    read_meter_shelly3em();
+#endif
+  }
+  else if (s.energy_meter_type == ENERGYM_FRONIUS_SOLAR) {
+#ifdef INVERTER_FRONIUS_SOLARAPI
+    read_inverter_fronius();
+#endif
+  }
+  else if (s.energy_meter_type == ENERGYM_SMA_MODBUS_TCP) {
+#ifdef INVERTER_SMA_MODBUS
+    read_inverter_sma();
+#endif
+  }
+}
+
 
 void set_relays()
 {
@@ -1018,9 +1167,7 @@ void onWebRootPost(AsyncWebServerRequest *request)
   String message;
   int paramsNr = request->params();
   Serial.println(paramsNr);
-  // s.sta_mode = request->getParam("sta_mode", true)->value().
-
-
+ 
   s.sta_mode = request->hasParam("sta_mode", true);
   Serial.print("s.sta_mode:");
   Serial.print(s.sta_mode);
@@ -1029,41 +1176,25 @@ void onWebRootPost(AsyncWebServerRequest *request)
   strcpy(s.wifi_password, request->getParam("wifi_password", true)->value().c_str());
   strcpy(s.http_username, request->getParam("http_username", true)->value().c_str());
   strcpy(s.http_password, request->getParam("http_password", true)->value().c_str());
-  strcpy(s.shelly_url, request->getParam("shelly_url", true)->value().c_str());
+
+  s.energy_meter_type = request->getParam("emt", true)->value().toInt();
+  strcpy(s.energy_meter_host, request->getParam("emh", true)->value().c_str());
+  s.energy_meter_port = request->getParam("emp", true)->value().toInt();
+  s.energy_meter_id = request->getParam("emid", true)->value().toInt();
+
 #ifdef INVERTER_FRONIUS_SOLARAPI
-  strcpy(s.fronius_address, request->getParam("fronius_address", true)->value().c_str());
+ // strcpy(s.fronius_address, request->getParam("fronius_address", true)->value().c_str());
   s.base_load_W = request->getParam("base_load_W", true)->value().toInt();
 
 #endif
 
 #ifdef QUERY_POWERGURU
-  strcpy(s.pg_url, request->getParam("pg_url", true)->value().c_str());
+ // strcpy(s.pg_url, request->getParam("pg_url", true)->value().c_str());
+  strcpy(s.pg_host, request->getParam("pg_host", true)->value().c_str());
+  s.pg_port = request->getParam("pg_port", true)->value().toInt();
   s.pg_cache_age = request->getParam("pg_cache_age", true)->value().toInt();
 #endif
-  /*
-    if (request->hasParam("states_ch0", true))
-    {
-      Serial.print("processing:");
-      Serial.println(request->getParam("states_ch0", true)->value().c_str());
-      str_to_uint_array(request->getParam("states_ch0", true)->value().c_str(), s.ch[0].upstates_ch);
-      Serial.print(s.ch[0].upstates_ch[0]);
-      Serial.print("...");
-      Serial.print(s.ch[0].upstates_ch[1]);
-      Serial.println();
-      s.ch[0].gpio = request->getParam("gpio_ch0", true)->value().toInt();
-      s.ch[0].default_up = request->hasParam("du_ch0", true);
-      s.ch[0].target_b_ch = request->getParam("t_b_ch0", true)->value().toFloat();
-      s.ch[0].target_u_ch = request->getParam("t_u_ch0", true)->value().toFloat();
-    }
-    if (request->hasParam("states_ch1", true))
-    {
-      str_to_uint_array(request->getParam("states_ch1", true)->value().c_str(), s.ch[1].upstates_ch);
-      s.ch[1].gpio = request->getParam("gpio_ch1", true)->value().toInt();
-      s.ch[1].default_up = request->hasParam("du_ch1", true);
-      s.ch[1].target_b_ch = request->getParam("t_b_ch1", true)->value().toFloat();
-      s.ch[1].target_u_ch = request->getParam("t_u_ch1", true)->value().toFloat();
-    }
-  */
+
   // channel/target fields
   char gpio_fld[9];
   char state_fld[8];
@@ -1079,7 +1210,7 @@ void onWebRootPost(AsyncWebServerRequest *request)
       snprintf(target_fld, 7, "t_%i_t%i", channel_idx, target_idx);
       if (request->hasParam(state_fld, true))
       {
-        str_to_uint_array(request->getParam(state_fld, true)->value().c_str(), s.ch[channel_idx].target[target_idx].upstates);
+        str_to_uint_array(request->getParam(state_fld, true)->value().c_str(), s.ch[channel_idx].target[target_idx].upstates,",");
         s.ch[channel_idx].target[target_idx].target = request->getParam(target_fld, true)->value().toFloat();
       }
     }
@@ -1179,12 +1310,6 @@ void setup()
     strcpy(s.http_username, "powerguru");
     strcpy(s.http_password, "powerguru");
 
-#ifdef QUERY_POWERGURU
-    // strcpy(s.pg_url, "http://192.168.66.8:8080/state_series?price_area=FI");
-#endif
-#ifdef METER_SHELLY3EM
-    // strcpy(s.shelly_url, "http://192.168.66.40/status");
-#endif
 
     // s.ch[0] = {{10101}, 20, 80, false, false, 14U}; // D5=GPIO14 , D1	GPIO5
     // s.ch[1] = {{10102}, 21, 81, false, false, 12U}; // D6=GPIO12, D3	GPIO0
@@ -1263,18 +1388,19 @@ void setup()
     writeToEEPROM();
 
     server_OTA.on("/", HTTP_GET, [](AsyncWebServerRequest *request)
-                  { request->send(200, "text/html", "<html><body><a href=\"/update\">update</a> | <a href=\"/restart\">restart</a></body></html>"); });
+                  { request->send(200, "text/html", "<html><body><h2>Update mode</h2><a href=\"/update\">update</a> | <a href=\"/restart\">restart</a></body></html>"); });
 
     server_OTA.on("/restart", HTTP_GET, [](AsyncWebServerRequest *request)
                   { ESP.restart(); });
     AsyncElegantOTA.begin(&server_OTA); // Start ElegantOTA
     server_ota_started = millis();
     server_OTA.begin(); // tähän joku timeout
-    delay(600000);
-    ESP.restart();
+    while (true){
+      delay(1000); //just wait here, until uploaded or restarted manually
+    }
   }
 #endif
-
+ 
 
   // TODO: prepare for no internet connection? -> channel defaults probably, RTC?
   // https://werner.rothschopf.net/202011_arduino_esp8266_ntp_en.htm
@@ -1357,26 +1483,27 @@ void loop()
 #ifdef SENSOR_DS18B20
     read_sensor_ds18B20();
 #endif
+/*
 #ifdef METER_SHELLY3EM
     read_meter_shelly3em();
 #endif
 #ifdef INVERTER_FRONIUS_SOLARAPI
     read_inverter_fronius();
-#endif
+#endif */
+    read_energy_meter();
     refresh_states(current_period_start);
     sensor_last_refresh = millis();
     set_relays(); // tässä voisi katsoa onko tarvetta mennä tähän eli onko tullut muutosta
-
   }
-
   if (period_changed)
   {
     previous_period_start = current_period_start;
     period_changed = false;
   }
 
-
-  
+#ifdef INVERTER_SMA_MODBUS
+   mb.task(); // process modbuss event queue
+#endif
 
  // delay(5000);
 }
