@@ -27,7 +27,7 @@
 
 #define RTCMEMORYSTART 65
 #define eepromaddr 0
-#define WATT_EPSILON 50
+#define WATT_EPSILON 0
 
 
 #define NETTING_PERIOD_MIN 60 // should be 60, later 15
@@ -776,8 +776,7 @@ void refresh_states(unsigned long current_period_start)
   time(&now);
   localtime_r(&now, &tm);
 
-   Serial.print(" refresh_states ");
-  // Serial.print(timeClient.getFormattedTime());
+  Serial.print(" refresh_states ");
   Serial.print(F("  current_period_start: "));
   Serial.println(current_period_start);
 
@@ -942,7 +941,6 @@ function emtChanged(val) {
 <div class="fldshort" id="baseld">base load (W):<input name="base_load_W" class="inpnum" type="text" value="%base_load_W%"></div>
 
 
-
 <div class="secbr"><h3>Channel 1</h3></div>
 <div class="fld"><div>Current status: %up_ch0%</div></div>
 %target_ch_0_0%
@@ -1027,6 +1025,7 @@ void get_metered_values(char *out)
   char buff[150];
   time_t current_time;
   time(&current_time);
+  localtime_r(&current_time, &tm);
 
   if (s.energy_meter_type == ENERGYM_SHELLY3EM)
   {
@@ -1046,8 +1045,15 @@ void get_metered_values(char *out)
   strcat(out, buff);
 #endif
   }
-   // Serial.print(timeClient.getFormattedTime());
-  snprintf(buff, 150, "<div class=\"fld\"><div>Updated %s, Energy updated %d seconds ago.</div></div>",timeClient.getFormattedTime(),(int)(current_time-energym_read_last));
+  time(&now);
+  time_t now_suntime = now + (s.lon * 240);
+  int sun_hour = int((now_suntime % (3600 * 24)) / 3600);
+  int sun_minute = int((now_suntime % (3600)) / 60);
+
+  snprintf(buff, 150, "<div class=\"fld\"><div> %ld Local time: %02d:%02d:%02d, solar time: %02d:%02d, energy updated %d seconds ago.</div></div>"
+  ,(long int)now
+  ,tm.tm_hour,tm.tm_min,tm.tm_sec
+  ,sun_hour,sun_minute,(int)(current_time-energym_read_last));
   strcat(out, buff);
 
   return;
@@ -1356,7 +1362,7 @@ void onWebRootPost(AsyncWebServerRequest *request)
     s.next_boot_ota_update = true;
     writeToEEPROM();
     //request->redirect("/update");
-    request->send(200, "text/html", "<html><head><meta http-equiv='refresh' content='5; url=./update' /></head><body></body></html>"); 
+    request->send(200, "text/html", "<html><head><meta http-equiv='refresh' content='5; url=./update' /></head><body>wait...</body></html>"); 
   }
 
 #endif
