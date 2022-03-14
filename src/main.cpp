@@ -14,13 +14,13 @@
 #include <ESPAsyncTCP.h>
 #endif
 
-//features enabled
+// features enabled
 #define QUERY_POWERGURU_ENABLED
 #define METER_SHELLY3EM_ENABLED
 #define SENSOR_DS18B20_ENABLED
 #define INVERTER_FRONIUS_SOLARAPI_ENABLED // can read Fronius inverter solarapi
-#define INVERTER_SMA_MODBUS_ENABLED  // can read SMA inverter Modbus TCP 
-#define RTC_DS3231_ENABLED
+#define INVERTER_SMA_MODBUS_ENABLED       // can read SMA inverter Modbus TCP
+//#define RTC_DS3231_ENABLED
 
 #define TARIFF_STATES_FI // add Finnish tariffs (yösähkö,kausisähkö) to active states
 
@@ -28,14 +28,15 @@
 
 #define RTCMEMORYSTART 65
 #define eepromaddr 0
-#define WATT_EPSILON 0
+#define WATT_EPSILON 50
 
-
-#define NETTING_PERIOD_MIN 5 // should be 60, later 15
+#define NETTING_PERIOD_MIN 60 // should be 60, later 15
 
 // Powerguru states generated internally
 #define STATE_BUYING 1001
-#define STATE_SELLING 1002
+#define STATE_SELLING 1005
+#define STATE_SELLING_BNOON 1006
+#define STATE_SELLING_ANOON 1007
 #define STATE_EXTRA_PRODUCTION 1010
 #define STATE_EXTRA_PRODUCTION_BNOON 1011
 #define STATE_EXTRA_PRODUCTION_ANOON 1012
@@ -44,7 +45,6 @@
 #define STATE_NIGHTENERGY_FI 131
 #define STATE_WINTERDAY_FI 140
 #define STATE_WINTERDAY_NO_FI 141
-
 
 #include <ESPAsyncWebServer.h>
 /* TODO: and caveats
@@ -64,6 +64,27 @@
 time_t now; // this is the epoch
 tm tm_struct;
 
+time_t forced_restart_ts = 0; // if wifi in forced ap-mode restart automatically to reconnect/start
+bool backup_ap_mode_on = false;
+#define FORCED_RESTART_DELAY 600
+void check_forced_restart(bool reset_counter = false)
+{
+  // tässä tapauksessa kello ei välttämättä ei kunnossa ellei rtc, käy läpi tapaukset
+  if (!backup_ap_mode_on) // only valid if forced ap-mode (no normal wifi)
+    return;
+  time_t now;
+  time(&now);
+  if (reset_counter)
+  {
+    forced_restart_ts = now + FORCED_RESTART_DELAY;
+  }
+  else if ((forced_restart_ts < now) && ((now-forced_restart_ts)<7200)) // check that both values are same way synched
+  {
+    Serial.println("check_forced_restart restarting");
+    delay(2000); //EI KAI TOIMI OIKEIN JOS KELLO EI ASETTTU
+    ESP.restart();
+  }
+}
 
 #define MY_NTP_SERVER "europe.pool.ntp.org"
 // for timezone https://github.com/nayarsystems/posix_tz_db/blob/master/zones.csv
@@ -79,19 +100,30 @@ AsyncWebServer server_web(80);
 #include <WiFiClient.h>
 #include <ArduinoJson.h>
 
+// Clock functions, supports optional DS3231 RTC
+// RTC based on https://werner.rothschopf.net/microcontroller/202112_arduino_esp_ntp_rtc_en.htm
+bool rtc_found = false;
+/*
+    Sets the internal time
+    epoch (seconds in GMT)
+    microseconds
+*/
+void setInternalTime(uint64_t epoch = 0, uint32_t us = 0)
+{
+  struct timeval tv;
+  tv.tv_sec = epoch;
+  tv.tv_usec = us;
+  settimeofday(&tv, NULL);
+}
+
+#ifdef RTC_DS3231_ENABLED
 #if ARDUINO_ESP8266_MAJOR < 3
 #pragma message("This sketch requires at least ESP8266 Core Version 3.0.0")
 #endif
-
-// https://werner.rothschopf.net/microcontroller/202112_arduino_esp_ntp_rtc_en.htm
-
-bool rtc_found = false;
-#ifdef RTC_DS3231_ENABLED
 #include <RTClib.h>
 #include <coredecls.h>
-#define  I2CSDA_GPIO 0 
-#define  I2CSCL_GPIO 12
-
+#define I2CSDA_GPIO 0
+#define I2CSCL_GPIO 12
 
 RTC_DS3231 rtc;
 /*
@@ -111,21 +143,19 @@ RTC_DS3231 rtc;
 */
 int64_t getTimestamp(int year, int mon, int mday, int hour, int min, int sec)
 {
-  const uint16_t ytd[12] = {0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334}; /* Anzahl der Tage seit Jahresanfang ohne Tage des aktuellen Monats und ohne Schalttag */
-  int leapyears = ((year - 1) - 1968) / 4
-                  - ((year - 1) - 1900) / 100
-                  + ((year - 1) - 1600) / 400; /* Anzahl der Schaltjahre seit 1970 (ohne das evtl. laufende Schaltjahr) */
+  const uint16_t ytd[12] = {0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334};                /* Anzahl der Tage seit Jahresanfang ohne Tage des aktuellen Monats und ohne Schalttag */
+  int leapyears = ((year - 1) - 1968) / 4 - ((year - 1) - 1900) / 100 + ((year - 1) - 1600) / 400; /* Anzahl der Schaltjahre seit 1970 (ohne das evtl. laufende Schaltjahr) */
   int64_t days_since_1970 = (year - 1970) * 365 + leapyears + ytd[mon - 1] + mday - 1;
-  if ( (mon > 2) && (year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)) )
+  if ((mon > 2) && (year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)))
     days_since_1970 += 1; /* +Schalttag, wenn Jahr Schaltjahr ist */
-  return sec + 60 * (min + 60 * (hour + 24 * days_since_1970) );
+  return sec + 60 * (min + 60 * (hour + 24 * days_since_1970));
 }
 /*
     print time of RTC to Serial
 */
 void printRTC()
 {
-  DateTime dtrtc = rtc.now();          // get date time from RTC i
+  DateTime dtrtc = rtc.now(); // get date time from RTC i
   if (!dtrtc.isValid())
   {
     Serial.println(F("E103: RTC not valid"));
@@ -146,14 +176,15 @@ void printRTC()
 void setRTC()
 {
   Serial.println(F("setRTC --> from internal time"));
-  time_t now;                          // this are the seconds since Epoch (1970) - seconds GMT
-  tm tm;                               // the structure tm holds time information in a more convient way
-  time(&now);                          // read the current time and store to now
-  gmtime_r(&now, &tm);                 // update the structure tm with the current GMT
+  time_t now;          // this are the seconds since Epoch (1970) - seconds GMT
+  tm tm;               // the structure tm holds time information in a more convient way
+  time(&now);          // read the current time and store to now
+  gmtime_r(&now, &tm); // update the structure tm with the current GMT
   rtc.adjust(DateTime(tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec));
 }
-void time_is_set(bool from_sntp) {
-  if (from_sntp)                       // needs Core 3.0.0 or higher!
+void time_is_set(bool from_sntp)
+{
+  if (from_sntp) // needs Core 3.0.0 or higher!
   {
     Serial.println(F("The internal time is set from SNTP."));
     setRTC();
@@ -165,24 +196,10 @@ void time_is_set(bool from_sntp) {
   }
 }
 
-/*
-    Sets the internal time
-    epoch (seconds in GMT)
-    microseconds
-*/
-void setInternalTime(uint64_t epoch = 0, uint32_t us = 0)
-{
-  struct timeval tv;
-  tv.tv_sec = epoch;
-  tv.tv_usec = us;
-  settimeofday(&tv, NULL);
-}
-
-
 void getRTC()
 {
   Serial.println(F("getRTC --> update internal clock"));
-  DateTime dtrtc = rtc.now();          // get date time from RTC i
+  DateTime dtrtc = rtc.now(); // get date time from RTC i
   if (!dtrtc.isValid())
   {
     Serial.print(F("E127: RTC not valid"));
@@ -191,7 +208,7 @@ void getRTC()
   {
     time_t newTime = getTimestamp(dtrtc.year(), dtrtc.month(), dtrtc.day(), dtrtc.hour(), dtrtc.minute(), dtrtc.second());
     setInternalTime(newTime);
-    //Serial.print(F("UTC:")); Serial.println(newTime);
+    // Serial.print(F("UTC:")); Serial.println(newTime);
     printRTC();
   }
 }
@@ -201,9 +218,9 @@ void getRTC()
 // Non-volatile memory https://github.com/CuriousTech/ESP-HVAC/blob/master/Arduino/eeMem.cpp
 #ifdef INVERTER_SMA_MODBUS_ENABLED
 #include <ModbusIP_ESP8266.h>
-//Modbus registry offsets
-#define SMA_DAYENERGY_OFFSET 30535 
-#define SMA_TOTALENERGY_OFFSET 30529 
+// Modbus registry offsets
+#define SMA_DAYENERGY_OFFSET 30535
+#define SMA_TOTALENERGY_OFFSET 30529
 #define SMA_POWER_OFFSET 30775
 #endif
 
@@ -212,7 +229,6 @@ unsigned long server_ota_started;
 #include <AsyncElegantOTA.h>
 AsyncWebServer server_OTA(80);
 #endif
-
 
 #ifdef SENSOR_DS18B20_ENABLED
 // see: https://randomnerdtutorials.com/esp8266-ds18b20-temperature-sensor-web-server-with-arduino-ide/
@@ -230,20 +246,19 @@ DallasTemperature sensors(&oneWire);
 float ds18B20_temp_c;
 #endif
 
-
 #ifdef QUERY_POWERGURU_ENABLED
 const char *pg_state_cache_filename = "/pg_state_cache.json";
 #endif
 
-#define USE_POWER_TO_ESTIMATE_ENERGY_SECS 120 //use power measurement to estimate
+#define USE_POWER_TO_ESTIMATE_ENERGY_SECS 120 // use power measurement to estimate
 
-unsigned process_interval_s = 30; // process interval
+unsigned process_interval_s = 60;                               // process interval
 unsigned long sensor_last_refresh = -process_interval_s * 1000; // start reading as soon as you get to first loop
 
-time_t recording_period_start = 0;    // first period: boot time, later period starts
+time_t recording_period_start = 0; // first period: boot time, later period starts
 time_t current_period_start = 0;
 time_t previous_period_start = 0;
-time_t energym_read_last =0;
+time_t energym_read_last = 0;
 time_t started = 0;
 bool period_changed = true;
 bool restart_required = false;
@@ -257,7 +272,7 @@ bool restart_required = false;
 #define MAX_ID_STR_LENGTH 30
 #define MAX_URL_STR_LENGTH 70
 
-//Energy metering type
+// Energy metering types
 #define ENERGYM_NONE 0
 #define ENERGYM_SHELLY3EM 1
 #define ENERGYM_FRONIUS_SOLAR 2
@@ -274,7 +289,6 @@ unsigned long energy_produced_period = 0;
 unsigned long power_produced_period_avg = 0;
 #endif
 
-
 typedef struct
 {
   uint16_t upstates[CHANNEL_STATES_MAX];
@@ -284,7 +298,7 @@ typedef struct
 
 typedef struct
 {
-  target_struct target[CHANNEL_TARGETS_MAX]; 
+  target_struct target[CHANNEL_TARGETS_MAX];
   uint8_t gpio;
   bool is_up;
 } channel_struct;
@@ -305,7 +319,7 @@ typedef struct
   uint16_t pg_cache_age;
 #endif
 #if defined(INVERTER_FRONIUS_SOLARAPI_ENABLED) || defined(INVERTER_SMA_MODBUS_ENABLED)
-uint32_t base_load_W; // production above base load is "free" to use/store
+  uint32_t base_load_W; // production above base load is "free" to use/store
 #endif
 #ifdef OTA_UPDATE_ENABLED
   bool next_boot_ota_update;
@@ -323,8 +337,8 @@ settings_struct s;
 
 uint16_t active_states[ACTIVE_STATES_MAX];
 
-//parse char array to uint16_t array (e.g. states, ip address)
-//note: current version alter str_in, so use copy in calls if original still needed
+// parse char array to uint16_t array (e.g. states, ip address)
+// note: current version alter str_in, so use copy in calls if original still needed
 void str_to_uint_array(const char *str_in, uint16_t array_out[CHANNEL_STATES_MAX], char *separator)
 {
   char *ptr = strtok((char *)str_in, separator);
@@ -346,7 +360,7 @@ void str_to_uint_array(const char *str_in, uint16_t array_out[CHANNEL_STATES_MAX
     {
       break;
     }
-  } 
+  }
   return;
 }
 
@@ -388,7 +402,6 @@ void handleRequest(AsyncWebServerRequest *request) {
   }
 };
 */
-
 
 void notFound(AsyncWebServerRequest *request)
 {
@@ -453,7 +466,7 @@ String httpGETRequest(const char *url, const char *cache_file_name)
 
 #ifdef SENSOR_DS18B20_ENABLED
 
-//TODO: reset (Voltage low) if value not within range
+// TODO: reset (Voltage low) if value not within range
 void read_sensor_ds18B20()
 {
   sensors.requestTemperatures();
@@ -470,8 +483,8 @@ float energyout_prev = 0;
 float energyin = 0;
 float energyout = 0;
 
-
-void get_values_shelly3m( float &netEnergyInPeriod , float &netPowerInPeriod) {
+void get_values_shelly3m(float &netEnergyInPeriod, float &netPowerInPeriod)
+{
   netEnergyInPeriod = (energyin - energyout - energyin_prev + energyout_prev);
   if ((meter_read_ts - last_period_last_ts) != 0)
   {
@@ -483,12 +496,11 @@ void get_values_shelly3m( float &netEnergyInPeriod , float &netPowerInPeriod) {
   }
 }
 
-
 bool read_meter_shelly3em()
 {
   if (strlen(s.energy_meter_host) == 0)
     return false;
-  DynamicJsonDocument doc(2048); 
+  DynamicJsonDocument doc(2048);
 
   String url = "http://" + String(s.energy_meter_host) + ":" + String(s.energy_meter_port) + "/status";
   DeserializationError error = deserializeJson(doc, httpGETRequest(url.c_str(), ""));
@@ -498,7 +510,7 @@ bool read_meter_shelly3em()
   {
     Serial.print(F("Shelly meter deserializeJson() failed: "));
     Serial.println(error.f_str());
-    return false; 
+    return false;
   }
 
   meter_read_ts = doc["unixtime"];
@@ -545,8 +557,6 @@ bool read_meter_shelly3em()
 }
 #endif
 
-
-
 #ifdef INVERTER_FRONIUS_SOLARAPI_ENABLED
 
 // new version under construction
@@ -585,13 +595,13 @@ bool read_inverter_fronius_data(long int &total_energy, long int &current_power)
     {
       Serial.print(", PAC:");
       Serial.print((long)Body_Data_item.value()["Value"]);
-      current_power = Body_Data_item.value()["Value"]; //update and return new value
+      current_power = Body_Data_item.value()["Value"]; // update and return new value
     }
     // use DAY_ENERGY (more accurate) instead of TOTAL_ENERGY
     if (Body_Data_item.key() == "DAY_ENERGY")
     {
       Serial.print("DAY_ENERGY:");
-      total_energy = Body_Data_item.value()["Value"]; //update and return new value    
+      total_energy = Body_Data_item.value()["Value"]; // update and return new value
     }
   }
   Serial.println();
@@ -624,7 +634,8 @@ bool cb(Modbus::ResultCode event, uint16_t transactionId, void *data)
     }
     //  mb.disconnect( remote);
   }
-  else {
+  else
+  {
     Serial.println("Modbus read succesfull");
   }
 
@@ -641,7 +652,7 @@ long int get_mbus_value(IPAddress remote, const int reg_offset, uint16_t reg_num
     mb.task();
     delay(10);
   }
-  
+
   if (reg_num == 1)
   {
     combined = buf[0];
@@ -649,12 +660,13 @@ long int get_mbus_value(IPAddress remote, const int reg_offset, uint16_t reg_num
   else if (reg_num == 2)
   {
     combined = buf[0] * (65536) + buf[1];
-  /*  Serial.print("DEBUG get_mbus_value:");
-    Serial.print(buf[0]);
-    Serial.print("#");
-    Serial.println(buf[1]);*/
-    if (buf[0] ==32768) { //special case
-      combined = 0; 
+    /*  Serial.print("DEBUG get_mbus_value:");
+      Serial.print(buf[0]);
+      Serial.print("#");
+      Serial.println(buf[1]);*/
+    if (buf[0] == 32768)
+    { // special case
+      combined = 0;
     }
   }
   else
@@ -673,7 +685,7 @@ bool read_inverter_sma_data(long int &total_energy, long int &current_power)
   // tässä voisi olla ip
   uint16_t ip_octets[CHANNEL_STATES_MAX];
   char host_ip[16];
-  strcpy(host_ip, s.energy_meter_host);// seuraava kutsu sotkee, siksi siksi kopio
+  strcpy(host_ip, s.energy_meter_host); // seuraava kutsu sotkee, siksi siksi kopio
   str_to_uint_array(host_ip, ip_octets, ".");
 
   IPAddress remote(ip_octets[0], ip_octets[1], ip_octets[2], ip_octets[3]);
@@ -690,10 +702,9 @@ bool read_inverter_sma_data(long int &total_energy, long int &current_power)
   uint16_t ip_port = s.energy_meter_port;
   uint8_t modbusip_unit = s.energy_meter_id;
 
-  Serial.print("ip_port, modbusip_unit: " );
+  Serial.print("ip_port, modbusip_unit: ");
   Serial.print(ip_port);
   Serial.println(modbusip_unit);
-  
 
   if (!mb.isConnected(remote))
   {
@@ -707,14 +718,14 @@ bool read_inverter_sma_data(long int &total_energy, long int &current_power)
     total_energy = get_mbus_value(remote, SMA_TOTALENERGY_OFFSET, 2, modbusip_unit);
     Serial.print(" total energy Wh:");
     Serial.print(total_energy);
-    
+
     current_power = get_mbus_value(remote, SMA_POWER_OFFSET, 2, modbusip_unit);
     Serial.print(", current power W:");
     Serial.println(current_power);
-/*
-    Serial.print("kesti:");
-    Serial.println(millis() - alku);
-    Serial.println();*/
+    /*
+        Serial.print("kesti:");
+        Serial.println(millis() - alku);
+        Serial.println();*/
     mb.disconnect(remote); // disconect in the end
 
     return true;
@@ -736,36 +747,41 @@ void read_inverter()
   long int total_energy = 0;
   long int current_power = 0;
 
-  bool reakOk=false;
-  if (s.energy_meter_type==ENERGYM_FRONIUS_SOLAR)
+  bool reakOk = false;
+  if (s.energy_meter_type == ENERGYM_FRONIUS_SOLAR)
+  {
     reakOk = read_inverter_fronius_data(total_energy, current_power);
-  else if (s.energy_meter_type==ENERGYM_SMA_MODBUS_TCP)
+    if (inverter_total_period_init > total_energy)
+      inverter_total_period_init = 0; // day have changed probably, reset counter, we get day totals from Fronius
+  }
+
+  else if (s.energy_meter_type == ENERGYM_SMA_MODBUS_TCP)
     reakOk = read_inverter_sma_data(total_energy, current_power);
 
   if (reakOk)
   {
     time(&energym_read_last);
-    
+
     if (period_changed)
     {
       Serial.println("PERIOD CHANGED");
       inverter_total_period_init = total_energy; // global
-      }
+    }
+
     energy_produced_period = total_energy - inverter_total_period_init;
     long int time_since_recording_period_start = now - recording_period_start;
 
     if (time_since_recording_period_start > USE_POWER_TO_ESTIMATE_ENERGY_SECS) // in the beginning of period use current power to estimate energy generated
       power_produced_period_avg = energy_produced_period * 3600 / time_since_recording_period_start;
-    else {
-        power_produced_period_avg = current_power;
+    else
+    {
+      power_produced_period_avg = current_power;
     }
-      
 
-    Serial.printf("energy_produced_period: %ld , time_since_recording_period_start: %ld , power_produced_period_avg: %ld , current_power:  %ld\n", energy_produced_period, time_since_recording_period_start, power_produced_period_avg,current_power);
+    Serial.printf("energy_produced_period: %ld , time_since_recording_period_start: %ld , power_produced_period_avg: %ld , current_power:  %ld\n", energy_produced_period, time_since_recording_period_start, power_produced_period_avg, current_power);
   }
 
 } // read_inverter
-
 
 #ifdef QUERY_POWERGURU_ENABLED
 bool is_cache_file_valid(const char *cache_file_name, unsigned long max_age_sec)
@@ -798,7 +814,7 @@ bool is_cache_file_valid(const char *cache_file_name, unsigned long max_age_sec)
 
   unsigned long ts = doc_ts["ts"];
   time(&now);
- 
+
   unsigned long age = now - ts;
 
   if (age > max_age_sec)
@@ -818,21 +834,33 @@ byte get_internal_states(uint16_t state_array[CHANNEL_STATES_MAX])
   time(&now);
   time_t now_suntime = now + s.lon * 240;
   byte sun_hour = int((now_suntime % (3600 * 24)) / 3600);
-  //byte sun_minute = int((now_suntime % (3600)) / 60);
-  // clean old
+  // byte sun_minute = int((now_suntime % (3600)) / 60);
+  //  clean old
   for (int i = 0; i < CHANNEL_STATES_MAX; i++)
   {
     state_array[i] = 0;
   }
   // add internally generated states, see https://github.com/Olli69/PowerGuru/blob/main/docs/states.md
   byte idx = 0;
-  state_array[idx++] = 1;                // 1 is always on
+  state_array[idx++] = 1;                       // 1 is always on
   state_array[idx++] = 100 + tm_struct.tm_hour; // time/hour based
 
 #ifdef METER_SHELLY3EM_ENABLED
-  if (s.energy_meter_type == ENERGYM_SHELLY3EM) {
-    state_array[idx++] = (energyin - energyout - energyin_prev + energyout_prev) > 0 ? STATE_BUYING : STATE_SELLING;
+  if (s.energy_meter_type == ENERGYM_SHELLY3EM)
+  {
+    float net_energy_in = (energyin - energyout - energyin_prev + energyout_prev);
+    if (net_energy_in < -WATT_EPSILON) 
+    {
+      state_array[idx++] = STATE_SELLING;
+      if (sun_hour < 12)
+        state_array[idx++] = STATE_SELLING_BNOON;
+      else
+        state_array[idx++] = STATE_SELLING_ANOON;
     }
+    else if (net_energy_in > WATT_EPSILON) {
+      state_array[idx++] = STATE_BUYING;
+    }
+  }
 #endif
 
 #ifdef TARIFF_STATES_FI
@@ -863,12 +891,12 @@ byte get_internal_states(uint16_t state_array[CHANNEL_STATES_MAX])
   }
 #endif
 
-
 #if defined(INVERTER_FRONIUS_SOLARAPI_ENABLED) || defined(INVERTER_SMA_MODBUS_ENABLED)
   // TODO: tsekkaa miksi joskus nousee ylös lyhyeksi aikaa vaikkei pitäisi
-  if (power_produced_period_avg > (s.base_load_W + WATT_EPSILON)) { //"extra" energy produced, more than estimated base load 
+  if (power_produced_period_avg > (s.base_load_W + WATT_EPSILON))
+  { //"extra" energy produced, more than estimated base load
     state_array[idx++] = STATE_EXTRA_PRODUCTION;
-     if (sun_hour<12)
+    if (sun_hour < 12)
       state_array[idx++] = STATE_EXTRA_PRODUCTION_BNOON;
     else
       state_array[idx++] = STATE_EXTRA_PRODUCTION_ANOON;
@@ -916,9 +944,9 @@ void refresh_states(time_t current_period_start)
   else
   {
     Serial.println(F("Cache not valid. Querying..."));
- 
+    //TODO:hardcoded price area
     // String url_to_call = String(s.pg_url) + "&states=";
-    String url_to_call = "http://" + String(s.pg_host) + ":" + String(s.pg_port) + "&states=";
+    String url_to_call = "http://" + String(s.pg_host) + ":" + String(s.pg_port) + "/state_series?price_area=FI&states=";
     String url_states_part = ",";
     char state_str_buffer[8];
     // char *ptr = 0;
@@ -1113,9 +1141,8 @@ void get_channel_target_fields(char *out, int channel_idx, int target_idx)
   String states = state_array_string(s.ch[channel_idx].target[target_idx].upstates);
   char float_buffer[10];
   dtostrf(s.ch[channel_idx].target[target_idx].target, 3, 1, float_buffer);
-  snprintf(out, 400, "<div><div  class=\"fldlong\">#%i target %s<input name=\"st_%i_t%i\" type=\"text\" value=\"%s\"></div></div><div class=\"fldshort\">Target:<input class=\"inpnum\" name=\"t_%i_t%i\" type=\"text\" value=\"%s\"></div></div>", target_idx + 1 ,s.ch[channel_idx].target[target_idx].target_active?"* ACTIVE *":"",channel_idx, target_idx, states.c_str(), channel_idx, target_idx, float_buffer);
+  snprintf(out, 400, "<div><div  class=\"fldlong\">#%i target %s<input name=\"st_%i_t%i\" type=\"text\" value=\"%s\"></div></div><div class=\"fldshort\">Target:<input class=\"inpnum\" name=\"t_%i_t%i\" type=\"text\" value=\"%s\"></div></div>", target_idx + 1, s.ch[channel_idx].target[target_idx].target_active ? "* ACTIVE *" : "", channel_idx, target_idx, states.c_str(), channel_idx, target_idx, float_buffer);
   return;
-  
 }
 
 void get_meter_config_fields(char *out)
@@ -1144,6 +1171,7 @@ void get_metered_values(char *out)
   char buff[150];
   time_t current_time;
   time(&current_time);
+
   localtime_r(&current_time, &tm_struct);
 
   time_t now_suntime = current_time + (s.lon * 240);
@@ -1152,58 +1180,56 @@ void get_metered_values(char *out)
   char time2[9];
   char eupdate[20];
 
-
-  
+  if (current_time < 1600000000)
+  {
+    strcat(out, "<div class=\"fld\">CLOCK UNSYNCHRONIZED!</div>");
+  }
 #ifdef SENSOR_DS18B20_ENABLED
-  snprintf(buff, 150, "<div class=\"fld\"><div>Temperature: %s</div></div>",String(ds18B20_temp_c,2).c_str());
+  snprintf(buff, 150, "<div class=\"fld\"><div>Temperature: %s</div></div>", String(ds18B20_temp_c, 2).c_str());
   strcat(out, buff);
 #else
-            return F("not in use");
+  return F("not in use");
 #endif
 
   gmtime_r(&now_suntime, &tm_sun);
-  snprintf(buff, 150, "<div class=\"fld\"><div>Local time: %02d:%02d:%02d, solar time: %02d:%02d:%02d</div></div>"
-  ,tm_struct.tm_hour,tm_struct.tm_min,tm_struct.tm_sec
-  ,tm_sun.tm_hour,tm_sun.tm_min,tm_sun.tm_sec);
+  snprintf(buff, 150, "<div class=\"fld\"><div>Local time: %02d:%02d:%02d, solar time: %02d:%02d:%02d</div></div>", tm_struct.tm_hour, tm_struct.tm_min, tm_struct.tm_sec, tm_sun.tm_hour, tm_sun.tm_min, tm_sun.tm_sec);
   strcat(out, buff);
 
-
   localtime_r(&recording_period_start, &tm_struct);
-  sprintf(time1, "%02d:%02d:%02d",tm_struct.tm_hour,tm_struct.tm_min,tm_struct.tm_sec);
+  sprintf(time1, "%02d:%02d:%02d", tm_struct.tm_hour, tm_struct.tm_min, tm_struct.tm_sec);
   localtime_r(&energym_read_last, &tm_struct);
-  
-  if (energym_read_last==0) {
-    strcpy(time2,"");
-    strcpy(eupdate,", not updated");
+
+  if (energym_read_last == 0)
+  {
+    strcpy(time2, "");
+    strcpy(eupdate, ", not updated");
   }
-  else {
-     sprintf(time2, "%02d:%02d:%02d",tm_struct.tm_hour,tm_struct.tm_min,tm_struct.tm_sec);
-      strcpy(eupdate,"");
+  else
+  {
+    sprintf(time2, "%02d:%02d:%02d", tm_struct.tm_hour, tm_struct.tm_min, tm_struct.tm_sec);
+    strcpy(eupdate, "");
   }
 
   if (s.energy_meter_type == ENERGYM_SHELLY3EM)
   {
 #ifdef METER_SHELLY3EM_ENABLED
-  float netEnergyInPeriod;
-  float netPowerInPeriod;
-  get_values_shelly3m(netEnergyInPeriod, netPowerInPeriod);
-  snprintf(buff, 150, "<div class=\"fld\"><div>Period %s-%s: net energy in %d Wh, power in  %d W %s</div></div>"
-  ,time1,time2,(int)netEnergyInPeriod, (int)netPowerInPeriod,eupdate);
-  strcat(out, buff);
+    float netEnergyInPeriod;
+    float netPowerInPeriod;
+    get_values_shelly3m(netEnergyInPeriod, netPowerInPeriod);
+    snprintf(buff, 150, "<div class=\"fld\"><div>Period %s-%s: net energy in %d Wh, power in  %d W %s</div></div>", time1, time2, (int)netEnergyInPeriod, (int)netPowerInPeriod, eupdate);
+    strcat(out, buff);
 #endif
   }
-  else if (s.energy_meter_type == ENERGYM_FRONIUS_SOLAR or (s.energy_meter_type == ENERGYM_SMA_MODBUS_TCP ))
+  else if (s.energy_meter_type == ENERGYM_FRONIUS_SOLAR or (s.energy_meter_type == ENERGYM_SMA_MODBUS_TCP))
   {
 #if defined(INVERTER_FRONIUS_SOLARAPI_ENABLED) || defined(INVERTER_SMA_MODBUS_ENABLED)
-  snprintf(buff, 150, "<div class=\"fld\"><div>Period %s-%s: produced %d Wh, power  %d W %s</div></div>",time1,time2,(int)energy_produced_period, (int)power_produced_period_avg,eupdate);
-  strcat(out, buff);
+    snprintf(buff, 150, "<div class=\"fld\"><div>Period %s-%s: produced %d Wh, power  %d W %s</div></div>", time1, time2, (int)energy_produced_period, (int)power_produced_period_avg, eupdate);
+    strcat(out, buff);
 #endif
   }
-
 
   return;
 }
-
 
 String setup_form_processor(const String &var)
 {
@@ -1235,7 +1261,6 @@ String setup_form_processor(const String &var)
     return F("(disabled)")
 #endif
 
-
   if (var.startsWith("target_ch_"))
   {
     // e.g target_ch_0_1
@@ -1250,20 +1275,21 @@ String setup_form_processor(const String &var)
     return state_array_string(active_states);
   }
 
-  if (var == "metered_values") {
+  if (var == "metered_values")
+  {
     char out[400];
     get_metered_values(out);
     return out;
   }
 
-  if (var == "lat") {
-    return String(s.lat,2);
+  if (var == "lat")
+  {
+    return String(s.lat, 2);
   }
-  if (var == "lon") {
-    return String(s.lon,2);
+  if (var == "lon")
+  {
+    return String(s.lon, 2);
   }
-
- 
 
 #ifdef QUERY_POWERGURU_ENABLED
   /*if (var == "pg_url")
@@ -1308,7 +1334,7 @@ void read_energy_meter()
       time(&energym_read_last);
 #endif
   }
-  else if (s.energy_meter_type == ENERGYM_FRONIUS_SOLAR or (s.energy_meter_type == ENERGYM_SMA_MODBUS_TCP ))
+  else if (s.energy_meter_type == ENERGYM_FRONIUS_SOLAR or (s.energy_meter_type == ENERGYM_SMA_MODBUS_TCP))
   {
 #if defined(INVERTER_FRONIUS_SOLARAPI_ENABLED) || defined(INVERTER_SMA_MODBUS_ENABLED)
     read_inverter();
@@ -1333,9 +1359,10 @@ void set_relays()
 
   // loop channels and check whether channel should be up
   for (int channel_idx = 0; channel_idx < CHANNELS; channel_idx++)
-  { //reset target_active variable
-    for (int target_idx = 0; target_idx < CHANNEL_TARGETS_MAX; target_idx++) {
-      s.ch[channel_idx].target[target_idx].target_active = false; 
+  { // reset target_active variable
+    for (int target_idx = 0; target_idx < CHANNEL_TARGETS_MAX; target_idx++)
+    {
+      s.ch[channel_idx].target[target_idx].target_active = false;
     }
     target_state_match_found = false;
 
@@ -1349,19 +1376,19 @@ void set_relays()
         for (int ch_state_idx = 0; ch_state_idx < CHANNEL_STATES_MAX; ch_state_idx++)
         {
           if (active_states[act_state_idx] == s.ch[channel_idx].target[target_idx].upstates[ch_state_idx])
-          { 
-            
+          {
+            target_state_match_found = true;
 #ifdef SENSOR_DS18B20_ENABLED
-                // TODO: check that sensor value is valid
-                //  states are matching, check if the sensor value is below given target (channel should be up) or reached (should be down)
-                if ((ds18B20_temp_c < s.ch[channel_idx].target[target_idx].target))
+            // TODO: check that sensor value is valid
+            //  states are matching, check if the sensor value is below given target (channel should be up) or reached (should be down)
+            if ((ds18B20_temp_c < s.ch[channel_idx].target[target_idx].target))
             {
               channel_should_be_up = true;
-               s.ch[channel_idx].target[target_idx].target_active = true;    
+              s.ch[channel_idx].target[target_idx].target_active = true;
             }
 #else
-                channel_should_be_up = target_state_match_found;
-                s.ch[channel_idx].target[target_idx].target_active = target_state_match_found;  
+            channel_should_be_up = true;
+            s.ch[channel_idx].target[target_idx].target_active = true;
 #endif
             if (target_state_match_found)
               break;
@@ -1369,11 +1396,10 @@ void set_relays()
         }
         if (target_state_match_found)
           break;
-      }  
+      }
       if (target_state_match_found)
         break;
-    } //target loop
-
+    } // target loop
 
     if (s.ch[channel_idx].is_up != channel_should_be_up)
     {
@@ -1405,6 +1431,9 @@ void onWebRootGet(AsyncWebServerRequest *request)
   if (!request->authenticate(s.http_username, s.http_password))
     return request->requestAuthentication();
   String message;
+
+  check_forced_restart(true); // if in forced ap-mode, reset counter to delay automatic restart
+
   // large char array, tested with 14k
   request->send_P(200, "text/html", setup_form_html, setup_form_processor);
 }
@@ -1423,7 +1452,6 @@ void onWebResetGet(AsyncWebServerRequest *request)
   EEPROM.commit();
   strcpy(s.http_username, "");
   s.sta_mode = false;
-  s.ch[0].gpio = 255; // not the best way
   s.check_value = 12345;
 
   writeToEEPROM();
@@ -1434,7 +1462,7 @@ void onWebResetGet(AsyncWebServerRequest *request)
 void onWebRootPost(AsyncWebServerRequest *request)
 {
   String message;
-  
+
   int paramsNr = request->params();
   Serial.println(paramsNr);
 
@@ -1447,11 +1475,11 @@ void onWebRootPost(AsyncWebServerRequest *request)
   strcpy(s.http_username, request->getParam("http_username", true)->value().c_str());
   strcpy(s.http_password, request->getParam("http_password", true)->value().c_str());
 
-  if (s.energy_meter_type != request->getParam("emt", true)->value().toInt()) {
-    restart_required= true;
+  if (s.energy_meter_type != request->getParam("emt", true)->value().toInt())
+  {
+    restart_required = true;
     s.energy_meter_type = request->getParam("emt", true)->value().toInt();
   }
-    
 
   Serial.println(request->getParam("emh", true)->value().c_str());
   strcpy(s.energy_meter_host, request->getParam("emh", true)->value().c_str());
@@ -1495,16 +1523,17 @@ void onWebRootPost(AsyncWebServerRequest *request)
       }
     }
   }
- 
-  
-  if (request->hasParam("timesync", true)) {
+
+  if (request->hasParam("timesync", true))
+  {
     time_t ts = request->getParam("ts", true)->value().toInt();
     Serial.print("TIMESTAMP:");
     Serial.print(ts);
     setInternalTime(ts);
-
+#ifdef RTC_DS3231_ENABLED
     if (rtc_found)
       setRTC();
+#endif
   }
 
 #ifdef OTA_UPDATE_ENABLED
@@ -1512,8 +1541,8 @@ void onWebRootPost(AsyncWebServerRequest *request)
   {
     s.next_boot_ota_update = true;
     writeToEEPROM();
-    //request->redirect("/update");
-    request->send(200, "text/html", "<html><head><meta http-equiv='refresh' content='5; url=./update' /></head><body>wait...</body></html>"); 
+    // request->redirect("/update");
+    request->send(200, "text/html", "<html><head><meta http-equiv='refresh' content='5; url=./update' /></head><body>wait...</body></html>");
   }
 
 #endif
@@ -1523,13 +1552,10 @@ void onWebRootPost(AsyncWebServerRequest *request)
   // delete cache file
   LittleFS.remove(pg_state_cache_filename);
   request->redirect("/");
-
-
 }
 
 void onWebStatusGet(AsyncWebServerRequest *request)
 {
-
   if (!request->authenticate(s.http_username, s.http_password))
   {
     return request->requestAuthentication();
@@ -1568,16 +1594,14 @@ void onWebStatusGet(AsyncWebServerRequest *request)
   request->send(200, "application/json", output);
 }
 
-
 void setup()
 {
   Serial.begin(115200);
 
-
 #ifdef SENSOR_DS18B20_ENABLED
 
-// voltage to 1-wire bus
-// voltage from data pin so we can reset the bus (voltage low) if needed
+  // voltage to 1-wire bus
+  // voltage from data pin so we can reset the bus (voltage low) if needed
   pinMode(ONEWIRE_VOLTAGE_GPIO, OUTPUT);
   digitalWrite(ONEWIRE_VOLTAGE_GPIO, HIGH);
 
@@ -1600,7 +1624,7 @@ void setup()
   Serial.print("AFTER READ EEPROM:");
   Serial.println(s.energy_meter_host);
 
-  if (s.check_value != 12345) 
+  if (s.check_value != 12345)
   {
     Serial.println(F("Initiating eeprom"));
     s.check_value = 12345; // this is indication that eeprom is initiated
@@ -1608,34 +1632,34 @@ void setup()
     strcpy(s.wifi_password, "powerguru");
     strcpy(s.http_username, "powerguru");
     strcpy(s.http_password, "powerguru");
- 
 
-  s.ch[0].gpio = 5;s.ch[1].gpio = 4;
-  s.lat = 64.96;
-  s.lon = 27.59;
-  for (int channel_idx = 0; channel_idx < CHANNELS; channel_idx++)
-    for (int target_idx = 0; target_idx < CHANNEL_TARGETS_MAX; target_idx++)
-    {
-      s.ch[channel_idx].target[target_idx] = {{}, 0};
-    }
+    s.ch[0].gpio = 5;
+    s.ch[1].gpio = 4;
+    s.lat = 64.96;
+    s.lon = 27.59;
+    for (int channel_idx = 0; channel_idx < CHANNELS; channel_idx++)
+      for (int target_idx = 0; target_idx < CHANNEL_TARGETS_MAX; target_idx++)
+      {
+        s.ch[channel_idx].target[target_idx] = {{}, 0};
+      }
 
 #ifdef QUERY_POWERGURU_ENABLED
-  strcpy(s.pg_host, "");
-  s.pg_port = 80;
-  s.pg_cache_age = 7200;
+    strcpy(s.pg_host, "");
+    s.pg_port = 80;
+    s.pg_cache_age = 7200;
 #endif
 #if defined(INVERTER_FRONIUS_SOLARAPI_ENABLED) || defined(INVERTER_SMA_MODBUS_ENABLED)
-s.base_load_W =  0; 
+    s.base_load_W = 0;
 #endif
 #ifdef OTA_UPDATE_ENABLED
-  s.next_boot_ota_update = false;
+    s.next_boot_ota_update = false;
 #endif
-  s.energy_meter_type = 0;
-  strcpy(s.energy_meter_host, "");
-  s.energy_meter_port = 80;
-  s.energy_meter_id = 3;
+    s.energy_meter_type = 0;
+    strcpy(s.energy_meter_host, "");
+    s.energy_meter_port = 80;
+    s.energy_meter_id = 3;
 
-  writeToEEPROM();
+    writeToEEPROM();
   }
 
   for (int i = 0; i < CHANNELS; i++)
@@ -1667,6 +1691,8 @@ s.base_load_W =  0;
     {
       Serial.println(F("WiFi Failed!"));
       create_ap = true; // try to create AP instead
+      backup_ap_mode_on = true;
+      check_forced_restart(true); // schedule restart
     }
     else
     {
@@ -1677,7 +1703,6 @@ s.base_load_W =  0;
     }
   }
 
-
   if (create_ap) // Softap should be created if so defined, cannot connect to wifi , redirect
   {              // check also https://github.com/me-no-dev/ESPAsyncWebServer/blob/master/examples/CaptivePortal/CaptivePortal.ino
     String mac = WiFi.macAddress();
@@ -1687,7 +1712,7 @@ s.base_load_W =  0;
     }
     String APSSID = String("powerguru-") + mac;
 
-    if (WiFi.softAP(APSSID.c_str(), "powerguru", (int)random(1, 14), false, 1) == true)
+    if (WiFi.softAP(APSSID.c_str(), "powerguru", (int)random(1, 14), false, 3) == true)
     {
       Serial.println(F("WiFi AP created with ip"));
       Serial.println(WiFi.softAPIP().toString());
@@ -1709,13 +1734,15 @@ s.base_load_W =  0;
     Serial.println("Couldn't find RTC!");
     Serial.flush();
   }
-    else {
-      rtc_found = true;
-      Serial.println("RTC found");
-      Serial.flush();
-      settimeofday_cb(time_is_set);                  // register callback if time was sent
-      if (time(nullptr) < 1600000000) getRTC();      // Fallback to RTC on startup if we are before 2020-09-13
-    }
+  else
+  {
+    rtc_found = true;
+    Serial.println("RTC found");
+    Serial.flush();
+    settimeofday_cb(time_is_set); // register callback if time was sent
+    if (time(nullptr) < 1600000000)
+      getRTC(); // Fallback to RTC on startup if we are before 2020-09-13
+  }
 
 #endif
 
@@ -1727,7 +1754,6 @@ s.base_load_W =  0;
     s.next_boot_ota_update = false; // next boot is normal
     writeToEEPROM();
 
-
     server_OTA.on("/", HTTP_GET, [](AsyncWebServerRequest *request)
                   { request->send(200, "text/html", "<html><body><h2>Update mode</h2><a href=\"/update\">update</a> | <a href=\"/restart\">restart</a></body></html>"); });
 
@@ -1735,7 +1761,7 @@ s.base_load_W =  0;
                   {  request->send(200, "text/html", "<html><head><meta http-equiv='refresh' content='10; url=./' /></head><body></body></html>"); 
                     ESP.restart(); });
 
-    AsyncElegantOTA.begin(&server_OTA,s.http_username,s.http_password); // Start ElegantOTA
+    AsyncElegantOTA.begin(&server_OTA, s.http_username, s.http_password); // Start ElegantOTA
     server_ota_started = millis();
     server_OTA.begin(); // tähän joku timeout
     while (true)
@@ -1747,17 +1773,14 @@ s.base_load_W =  0;
 
   // TODO: prepare for no internet connection? -> channel defaults probably, RTC?
   // https://werner.rothschopf.net/202011_arduino_esp8266_ntp_en.htm
-  RTC_DS3231_ENABLED(MY_TZ, MY_NTP_SERVER); // --> Here is the IMPORTANT ONE LINER needed in your sketch!
+  configTime(MY_TZ, MY_NTP_SERVER); // --> Here is the IMPORTANT ONE LINER needed in your sketch!
 
   server_web.on("/reset", HTTP_GET, onWebResetGet);
   server_web.on("/status", HTTP_GET, onWebStatusGet);
   server_web.on("/", HTTP_GET, onWebRootGet);
   server_web.on("/", HTTP_POST, onWebRootPost);
   server_web.on("/restart", HTTP_GET, [](AsyncWebServerRequest *request)
-                  {  request->redirect("/"); });//actually called from 
-                    
-
- 
+                { request->redirect("/"); }); // actually called from
 
   /* if (create_ap) {
      server_web.addHandler(new CaptiveRequestHandler()).setFilter(ON_AP_FILTER);//only when requested from AP
@@ -1780,13 +1803,12 @@ s.base_load_W =  0;
 
   // TODO: if not ntp server: could we get old ts from eeprom (rtcmem has more cycles), or how about using date from  powerguru/shelly query (if used)
   //  ehkä tästä saisi jotain, vaikkei olekaan viimeisen päälle, rtcmem olisi paras paikka kun ei kulum kai, https://stackoverflow.com/questions/54458116/how-can-i-set-the-esp32s-clock-without-access-to-the-internet
- /* do
-  {
-    time(&started);
-    delay(1000);
-    Serial.print("*");
-  } while (started < 1600000000);*/
- 
+  /* do
+   {
+     time(&started);
+     delay(1000);
+     Serial.print("*");
+   } while (started < 1600000000);*/
 
 } // end of setup()
 
@@ -1801,9 +1823,11 @@ void loop()
   /*if (!s.sta_mode) {
     dnsServer.processNextRequest();
   }*/
+
 #ifdef OTA_UPDATE_ENABLED
   // resetting and rebooting in update more
-  if (s.next_boot_ota_update || restart_required) {
+  if (s.next_boot_ota_update || restart_required)
+  {
     delay(1000);
     ESP.restart();
   }
@@ -1812,8 +1836,10 @@ void loop()
   time(&now);
   if (now < 1600000000) // we need clock set
     return;
-  if (started <1600000000)
+  if (started < 1600000000)
     started = now;
+
+  check_forced_restart(); // if in forced ap-mode restart if scheduled so
 
   current_period_start = get_period_start_time(now); // long(now / (NETTING_PERIOD_MIN * 60UL)) * (NETTING_PERIOD_MIN * 60UL);
   if (get_period_start_time(now) == get_period_start_time(started))

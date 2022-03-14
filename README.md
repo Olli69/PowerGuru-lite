@@ -34,6 +34,7 @@ Example 2 channel configuration with ESP8266  based 2 channel relay module ja te
 - ESP8266 (ESP-12F) Relay Module [Aliexpress](https://www.aliexpress.com/item/1005001908708140.html)
 - USB to TTL converter for initial setup (this board does not have an USB connector), [e.g.](https://www.aliexpress.com/item/32529737466.html?), 
 - female-female Dupont Dupont jumper lines for TTL connector, 4 pcs, [e.g.](https://www.aliexpress.com/item/1005003007413890.html)
+- Optional DS3231 real time clock (RTC). Without RTC clock sync from internet or manual clock sync is needed after restart (including power breaks).
 
 ### Temperature sensor DS18B20
 - DS18B20 waterproof temperature sensor, [Aliexpress](https://www.aliexpress.com/item/4000550061662.html)
