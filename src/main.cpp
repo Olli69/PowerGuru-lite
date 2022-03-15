@@ -343,6 +343,7 @@ typedef struct
   byte energy_meter_id;
   float lat;
   float lon;
+  char forecast_loc[MAX_ID_STR_LENGTH];
 } settings_struct;
 
 // this stores settings also to eeprom
@@ -854,6 +855,8 @@ bool is_cache_file_valid(const char *cache_file_name, unsigned long max_age_sec)
 byte get_internal_states(uint16_t state_array[CHANNEL_STATES_MAX])
 {
   time(&now);
+  localtime_r(&now, &tm_struct);
+
   time_t now_suntime = now + s.lon * 240;
   byte sun_hour = int((now_suntime % (3600 * 24)) / 3600);
   // byte sun_minute = int((now_suntime % (3600)) / 60);
@@ -868,6 +871,7 @@ byte get_internal_states(uint16_t state_array[CHANNEL_STATES_MAX])
   state_array[idx++] = 100 + tm_struct.tm_hour; // time/hour based
 
 #ifdef METER_SHELLY3EM_ENABLED
+  // grid energy meter enabled
   if (s.energy_meter_type == ENERGYM_SHELLY3EM)
   {
     float net_energy_in = (energyin - energyout - energyin_prev + energyout_prev);
@@ -924,6 +928,8 @@ byte get_internal_states(uint16_t state_array[CHANNEL_STATES_MAX])
 
 void refresh_states(time_t current_period_start)
 {
+  
+
   // get first internal states, then add  more from PG server
   byte idx = get_internal_states(active_states);
 
@@ -933,8 +939,7 @@ void refresh_states(time_t current_period_start)
   if (strlen(s.pg_host) == 0)
     return;
 
-  time(&now);
-  localtime_r(&now, &tm_struct);
+
 
   Serial.print(" refresh_states ");
   Serial.print(F("  current_period_start: "));
@@ -962,9 +967,10 @@ void refresh_states(time_t current_period_start)
     Serial.println(F("Cache not valid. Querying..."));
     // TODO:hardcoded price area
     //  String url_to_call = String(s.pg_url) + "&states=";
-    String url_to_call = "http://" + String(s.pg_host) + ":" + String(s.pg_port) + "/state_series?price_area=FI&states=";
+    String url_to_call = "http://" + String(s.pg_host) + ":" + String(s.pg_port) + "/state_series?price_area=FI&location=" + String(s.forecast_loc) + "&states=";
     String url_states_part = ",";
     char state_str_buffer[8];
+    //s.forecast_loc
     // char *ptr = 0;
 
     // add only used states to to state query
@@ -1158,7 +1164,10 @@ function beforeSubmit() {
 
 
 <div class="secbr"><h3>Location</h3></div>
-<div class="fld"><div class="fldtiny">lat:<input name="lat" type="text" value="%lat%"></div><div class="fldtiny">lon:<input name="lon" type="text" value="%lon%"></div></div>
+<div class="fld"><div class="fldtiny">lat:<input name="lat" type="text" value="%lat%"></div>
+<div class="fldtiny">lon:<input name="lon" type="text" value="%lon%"></div>
+<div class="fldshort">location:<input name="forecast_loc" maxlen='29' type="text" value="%forecast_loc%"></div>
+</div>
 
 <div class="secbr"><h3>WiFi</h3></div>
 <div class="fld"><input type="checkbox" id="sta_mode" name="sta_mode" value="sta_mode" %sta_mode%><label for="sta_mode"> Connect to existing wifi network</label></div>
@@ -1386,6 +1395,11 @@ String setup_form_processor(const String &var)
   {
     return String(s.lon, 2);
   }
+   if (var == "forecast_loc")
+  {
+    return String(s.forecast_loc);
+  }
+  
 
 #ifdef QUERY_POWERGURU_ENABLED
   /*if (var == "pg_url")
@@ -1619,6 +1633,8 @@ void onWebRootPost(AsyncWebServerRequest *request)
 
   s.lat = request->getParam("lat", true)->value().toFloat();
   s.lon = request->getParam("lon", true)->value().toFloat();
+  strcpy(s.forecast_loc, request->getParam("forecast_loc", true)->value().c_str());
+  
 
 #ifdef INVERTER_FRONIUS_SOLARAPI_ENABLED
   // strcpy(s.fronius_address, request->getParam("fronius_address", true)->value().c_str());
@@ -2022,7 +2038,7 @@ void loop()
   {
     Serial.print(F("Reading sensor and meter data..."));
 #ifdef SENSOR_DS18B20_ENABLED
-    bool ds_read_ok = read_sensor_ds18B20();
+    read_sensor_ds18B20();
 #endif
 
     read_energy_meter();
