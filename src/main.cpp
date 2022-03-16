@@ -353,7 +353,7 @@ uint16_t active_states[ACTIVE_STATES_MAX];
 
 // parse char array to uint16_t array (e.g. states, ip address)
 // note: current version alter str_in, so use copy in calls if original still needed
-void str_to_uint_array(const char *str_in, uint16_t array_out[CHANNEL_STATES_MAX], char *separator)
+void str_to_uint_array(const char *str_in, uint16_t array_out[CHANNEL_STATES_MAX], const char *separator)
 {
   char *ptr = strtok((char *)str_in, separator);
   byte i = 0;
@@ -487,15 +487,15 @@ bool read_sensor_ds18B20()
   float value_read = sensors.getTempCByIndex(0);
   if (value_read < -126)
   {
-    pinMode(ONEWIRE_VOLTAGE_GPIO, OUTPUT);
+    //pinMode(ONEWIRE_VOLTAGE_GPIO, OUTPUT);
     digitalWrite(ONEWIRE_VOLTAGE_GPIO, LOW);
-    delay(3000);
+    delay(5000);
     digitalWrite(ONEWIRE_VOLTAGE_GPIO, HIGH);
     delay(5000);
     value_read = sensors.getTempCByIndex(0);
     Serial.printf("Temperature after sensor reset: %f \n", ds18B20_temp_c);
   }
-  if (value_read > -126)
+  if (value_read > 0.1) //TODO: check why it fails so often
   { // use old value if  cannot read new
     ds18B20_temp_c = value_read;
     time(&temperature_updated);
@@ -710,7 +710,6 @@ long int get_mbus_value(IPAddress remote, const int reg_offset, uint16_t reg_num
 
 bool read_inverter_sma_data(long int &total_energy, long int &current_power)
 {
-  long int alku = millis();
   // IPAddress remote(); // veikkola.duckdns.org 84.231.164.210
   // IPAddress remote(84,231,164,210);
   // remote.fromString(s.energy_meter_host);
@@ -718,7 +717,9 @@ bool read_inverter_sma_data(long int &total_energy, long int &current_power)
   uint16_t ip_octets[CHANNEL_STATES_MAX];
   char host_ip[16];
   strcpy(host_ip, s.energy_meter_host); // seuraava kutsu sotkee, siksi siksi kopio
+  //char const *sep_point = ".";
   str_to_uint_array(host_ip, ip_octets, ".");
+  //str_to_uint_array(host_ip, ip_octets, sep_point);
 
   IPAddress remote(ip_octets[0], ip_octets[1], ip_octets[2], ip_octets[3]);
 
@@ -745,10 +746,7 @@ bool read_inverter_sma_data(long int &total_energy, long int &current_power)
     current_power = get_mbus_value(remote, SMA_POWER_OFFSET, 2, modbusip_unit);
     Serial.print(", current power W:");
     Serial.println(current_power);
-    /*
-        Serial.print("kesti:");
-        Serial.println(millis() - alku);
-        Serial.println();*/
+
     mb.disconnect(remote); // disconect in the end
 
     return true;
@@ -774,7 +772,7 @@ void read_inverter()
   if (s.energy_meter_type == ENERGYM_FRONIUS_SOLAR)
   {
     reakOk = read_inverter_fronius_data(total_energy, current_power);
-    if (inverter_total_period_init > total_energy)
+    if ((long)inverter_total_period_init > total_energy)
       inverter_total_period_init = 0; // day have changed probably, reset counter, we get day totals from Fronius
   }
 
@@ -1674,6 +1672,7 @@ void onWebRootPost(AsyncWebServerRequest *request)
       s.ch[channel_idx].type = request->getParam(ch_fld, true)->value().toInt();
     else
       Serial.println(ch_fld);
+    //char const *sep_comma = ",";
 
     for (int target_idx = 0; target_idx < CHANNEL_TARGETS_MAX; target_idx++)
     {
@@ -1681,7 +1680,9 @@ void onWebRootPost(AsyncWebServerRequest *request)
       snprintf(target_fld, 7, "t_%i_t%i", channel_idx, target_idx);
       if (request->hasParam(state_fld, true))
       {
+
         str_to_uint_array(request->getParam(state_fld, true)->value().c_str(), s.ch[channel_idx].target[target_idx].upstates, ",");
+       // str_to_uint_array(request->getParam(state_fld, true)->value().c_str(), s.ch[channel_idx].target[target_idx].upstates, sep_comma);
         Serial.println(request->getParam(target_fld, true)->value().c_str());
         s.ch[channel_idx].target[target_idx].target = request->getParam(target_fld, true)->value().toFloat();
       }
