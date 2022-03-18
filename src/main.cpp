@@ -330,6 +330,8 @@ typedef struct
   char pg_host[MAX_ID_STR_LENGTH];
   unsigned int pg_port;
   uint16_t pg_cache_age;
+  char pg_api_key[37];
+  
 #endif
 #if defined(INVERTER_FRONIUS_SOLARAPI_ENABLED) || defined(INVERTER_SMA_MODBUS_ENABLED)
   uint32_t base_load_W; // production above base load is "free" to use/store
@@ -487,7 +489,7 @@ bool read_sensor_ds18B20()
   float value_read = sensors.getTempCByIndex(0);
   if (value_read < -126)
   {
-    //pinMode(ONEWIRE_VOLTAGE_GPIO, OUTPUT);
+    // pinMode(ONEWIRE_VOLTAGE_GPIO, OUTPUT);
     digitalWrite(ONEWIRE_VOLTAGE_GPIO, LOW);
     delay(5000);
     digitalWrite(ONEWIRE_VOLTAGE_GPIO, HIGH);
@@ -495,8 +497,8 @@ bool read_sensor_ds18B20()
     value_read = sensors.getTempCByIndex(0);
     Serial.printf("Temperature after sensor reset: %f \n", ds18B20_temp_c);
   }
-  if (value_read > 0.1) //TODO: check why it fails so often
-  { // use old value if  cannot read new
+  if (value_read > 0.1) // TODO: check why it fails so often
+  {                     // use old value if  cannot read new
     ds18B20_temp_c = value_read;
     time(&temperature_updated);
     return true;
@@ -717,9 +719,9 @@ bool read_inverter_sma_data(long int &total_energy, long int &current_power)
   uint16_t ip_octets[CHANNEL_STATES_MAX];
   char host_ip[16];
   strcpy(host_ip, s.energy_meter_host); // seuraava kutsu sotkee, siksi siksi kopio
-  //char const *sep_point = ".";
+  // char const *sep_point = ".";
   str_to_uint_array(host_ip, ip_octets, ".");
-  //str_to_uint_array(host_ip, ip_octets, sep_point);
+  // str_to_uint_array(host_ip, ip_octets, sep_point);
 
   IPAddress remote(ip_octets[0], ip_octets[1], ip_octets[2], ip_octets[3]);
 
@@ -924,9 +926,15 @@ byte get_internal_states(uint16_t state_array[CHANNEL_STATES_MAX])
   return idx;
 }
 
+int channel_target_count(int channel_idx)
+{
+  if (s.ch[channel_idx].type == CH_TYPE_ON_UPTO_TARGET)
+    return CHANNEL_TARGETS_MAX;
+  else
+    return 1;
+}
 void refresh_states(time_t current_period_start)
 {
-  
 
   // get first internal states, then add  more from PG server
   byte idx = get_internal_states(active_states);
@@ -936,8 +944,6 @@ void refresh_states(time_t current_period_start)
 #endif
   if (strlen(s.pg_host) == 0)
     return;
-
-
 
   Serial.print(" refresh_states ");
   Serial.print(F("  current_period_start: "));
@@ -965,15 +971,17 @@ void refresh_states(time_t current_period_start)
     Serial.println(F("Cache not valid. Querying..."));
     // TODO:hardcoded price area
     //  String url_to_call = String(s.pg_url) + "&states=";
-    String url_to_call = "http://" + String(s.pg_host) + ":" + String(s.pg_port) + "/state_series?price_area=FI&location=" + String(s.forecast_loc) + "&states=";
+    String url_to_call = "http://" + String(s.pg_host) + ":" + String(s.pg_port) + "/state_series?price_area=FI&location=" + String(s.forecast_loc) + "&api_key=" + String(s.pg_api_key) + "&states=";
     String url_states_part = ",";
     char state_str_buffer[8];
-    //s.forecast_loc
-    // char *ptr = 0;
+    // s.forecast_loc
+    //  char *ptr = 0;
 
     // add only used states to to state query
     for (int channel_idx = 0; channel_idx < CHANNELS; channel_idx++)
-      for (int target_idx = 0; target_idx < CHANNEL_TARGETS_MAX; target_idx++)
+    {
+
+      for (int target_idx = 0; target_idx < channel_target_count(channel_idx); target_idx++)
       {
         for (int ch_state_idx = 0; ch_state_idx < CHANNEL_STATES_MAX; ch_state_idx++)
         {
@@ -999,6 +1007,7 @@ void refresh_states(time_t current_period_start)
           }
         }
       }
+    }
     url_states_part.replace(" ", "");
     url_to_call += url_states_part;
     Serial.println(url_to_call);
@@ -1060,8 +1069,8 @@ const char setup_form_html[] PROGMEM = R"===(<html>
 </head>
 <body onload="fieldCheck(%emt%);">
 <script>
-  CHANNELS = 2; 
-  TARGETS =3;
+  CHANNELS = %CHANNELS%; 
+  CHANNEL_TARGETS_MAX = %CHANNEL_TARGETS_MAX%;
 function fieldCheck(val) {
   idx = parseInt(val);
   //TODO: hardcoded, get from c++ defination
@@ -1101,21 +1110,31 @@ function fieldCheck(val) {
         setTargetFields(ch,0);
   }
 }
+
 function setTargetFields(ch,chtype) {
     console.log("setTargetFields:",ch,chtype);
-    for(var t=0;t<TARGETS;t++) {
+    for(var t=0;t<CHANNEL_TARGETS_MAX;t++) {
     divid = 'td_' + ch + "_" + t;
     var targetdiv =  document.querySelector('#' + divid );
-    if (chtype ==1) 
+    var statediv =  document.querySelector('#sd_' + ch + "_" + t );
+    
+    if (chtype ==1) {
       targetdiv.style.display = "block";
-    else 
+      statediv.style.display = "block";
+      }
+    else {
       targetdiv.style.display = "none";
+      if (t>0)
+        statediv.style.display = "none";
+      }
+
     }
 }
-function  fieldCheck2(obj) {
+
+function fieldCheck2(obj) {
   if (obj == null)
     return;
-  const fldA = obj.id.split("_"); // ch_t_0_0
+  const fldA = obj.id.split("_"); 
   ch = parseInt(fldA[2]);
   var chtype = obj.value;
   setTargetFields(ch,chtype);
@@ -1128,44 +1147,34 @@ function beforeSubmit() {
 <form method="post" onsubmit="beforeSubmit();">
 <div class="secbr"><h3>Status</h3></div>
 %metered_values%
-<div class="fld"><div>Active states: %states%</div></div>
-<div class="secbr"><h3>PowerGuru Server</h3></div>
-<div class="fld">
-<div class="fldh">host:<input name="pg_host" type="text" value="%pg_host%"></div>
-<div class="fldtiny">port:<input name="pg_port" type="text" value="%pg_port%"></div>
-<div class="fldshort">Max cache age:<input class="inpnum" name="pg_cache_age" type="text" value="%pg_cache_age%"></div>
-</div>
+<div class="fld">Active states: %states%</div>
+%chi_0% %cht_0%
+%chi_1% %cht_1%
+%chi_2% %cht_2%
+%chi_3% %cht_3%
 
-<br>
 %energy_meter_fields%
 
 <div class="fldshort" id="baseld">base load (W):<input name="base_load_W" class="inpnum" type="text" value="%base_load_W%"></div>
 
+<div class="secbr"><h3>PowerGuru Server</h3></div>
+<div class="fld">
+<div class="fldh">host:<input name="pg_host" type="text" value="%pg_host%"></div>
+<div class="fldtiny">port:<input name="pg_port" type="text" value="%pg_port%"></div>
 
-<div class="secbr"><h3>Channel 1</h3></div>
-<div class="fld"><div>Current status: %up_ch_0%</div></div>
-%info_ch_0%
-%target_ch_0_0%
-%target_ch_0_1%
-%target_ch_0_2%
+<div class="fldtiny">Max cache age (>=3600):<input class="inpnum" name="pg_cache_age" type="text" value="%pg_cache_age%"></div>
+<div class="fld">API key:<input name="pg_api_key" type="text" value="%pg_api_key%"></div>
 
-
-<div class="secbr"><h3>Channel 2</h3></div>
-<div class="fld"><div>Current status: %up_ch_1%</div></div>
-%info_ch_1%
-%target_ch_1_0%
-%target_ch_1_1%
-%target_ch_1_2%
+<div class="secbr"><div class="fldtiny">lat:<input name="lat" type="text" value="%lat%"></div>
+<div class="fldtiny">lon:<input name="lon" type="text" value="%lon%"></div>
+<div class="fldshort">forecast location:<input name="forecast_loc" maxlen='29' type="text" value="%forecast_loc%"></div>
+</div>
 
 <div class="fld"><div><a href="https://github.com/Olli69/powerguru/blob/main/docs/states.md" target="_blank">State list</a></div></div>
 
 
 
-<div class="secbr"><h3>Location</h3></div>
-<div class="fld"><div class="fldtiny">lat:<input name="lat" type="text" value="%lat%"></div>
-<div class="fldtiny">lon:<input name="lon" type="text" value="%lon%"></div>
-<div class="fldshort">location:<input name="forecast_loc" maxlen='29' type="text" value="%forecast_loc%"></div>
-</div>
+
 
 <div class="secbr"><h3>WiFi</h3></div>
 <div class="fld"><input type="checkbox" id="sta_mode" name="sta_mode" value="sta_mode" %sta_mode%><label for="sta_mode"> Connect to existing wifi network</label></div>
@@ -1211,11 +1220,11 @@ void get_channel_info_fields(char *out, int channel_idx)
   Serial.println(strlen(out));
   strcat(out, buff);
 
-  snprintf(buff, 200, "<div class='fldshort'>type:<br> <input type='radio' id='ch_t_%d_0' name='ch_t_%d' value='0' onclick='fieldCheck2(this)' %s><label for='ch_t_%d_0'>up</label>", channel_idx, channel_idx,s.ch[channel_idx].type==CH_TYPE_ONOFF?"checked":"", channel_idx);
+  snprintf(buff, 200, "<div class='fldshort'>type:<br> <input type='radio' id='ch_t_%d_0' name='ch_t_%d' value='0' onclick='fieldCheck2(this)' %s><label for='ch_t_%d_0'>up</label>", channel_idx, channel_idx, s.ch[channel_idx].type == CH_TYPE_ONOFF ? "checked" : "", channel_idx);
   Serial.println(strlen(out));
   strcat(out, buff);
 
-  snprintf(buff, 200, "<input type='radio' id='ch_t_%d_1' name='ch_t_%d' value='1' onclick='fieldCheck2(this)' %s><label for='ch_t_%d_1'>target</label></div>", channel_idx, channel_idx,s.ch[channel_idx].type==CH_TYPE_ON_UPTO_TARGET?"checked":"", channel_idx);
+  snprintf(buff, 200, "<input type='radio' id='ch_t_%d_1' name='ch_t_%d' value='1' onclick='fieldCheck2(this)' %s><label for='ch_t_%d_1'>target</label></div>", channel_idx, channel_idx, s.ch[channel_idx].type == CH_TYPE_ON_UPTO_TARGET ? "checked" : "", channel_idx);
   Serial.println(strlen(out));
   strcat(out, buff);
   snprintf(buff, 200, "<div class='fldtiny'>gpio: <input name='gpio_ch_%d' type='text' value='%d'></div></div>", channel_idx, s.ch[channel_idx].gpio);
@@ -1223,13 +1232,12 @@ void get_channel_info_fields(char *out, int channel_idx)
   strcat(out, buff);
 }
 
-void get_channel_target_fields(char *out, int channel_idx, int target_idx)
+void get_channel_target_fields(char *out, int channel_idx, int target_idx, int buff_len)
 {
   String states = state_array_string(s.ch[channel_idx].target[target_idx].upstates);
   char float_buffer[32]; // to prevent overflow if initiated with a long number...
   dtostrf(s.ch[channel_idx].target[target_idx].target, 3, 1, float_buffer);
-  snprintf(out, 400, "<div><div  class=\"fldlong\">#%i target %s<input name=\"st_%i_t%i\" type=\"text\" value=\"%s\"></div></div><div class=\"fldshort\" id=\"td_%i_%i\">Target:<input class=\"inpnum\" name=\"t_%i_t%i\" type=\"text\" value=\"%s\"></div></div>", target_idx + 1, s.ch[channel_idx].target[target_idx].target_active ? "* ACTIVE *" : ""
-  , channel_idx, target_idx, states.c_str(), channel_idx, target_idx, channel_idx, target_idx, float_buffer);
+  snprintf(out, buff_len, "<div><div id='sd_%i_%i' class=\"fldlong\">#%i states %s<input name=\"st_%i_t%i\" type=\"text\" value=\"%s\"></div></div><div class=\"fldshort\" id=\"td_%i_%i\">Target:<input class=\"inpnum\" name=\"t_%i_t%i\" type=\"text\" value=\"%s\"></div></div>", channel_idx, target_idx, target_idx + 1, s.ch[channel_idx].target[target_idx].target_active ? "* ACTIVE *" : "", channel_idx, target_idx, states.c_str(), channel_idx, target_idx, channel_idx, target_idx, float_buffer);
   return;
 }
 
@@ -1323,6 +1331,12 @@ void get_metered_values(char *out)
 
 String setup_form_processor(const String &var)
 {
+  // Javascript replacements
+  if (var == "CHANNELS")
+    return String(CHANNELS);
+  if (var == "CHANNEL_TARGETS_MAX")
+    return String(CHANNEL_TARGETS_MAX);
+
   if (var == "sta_mode")
     return s.sta_mode ? "checked" : "";
   if (var == "wifi_ssid")
@@ -1352,23 +1366,57 @@ String setup_form_processor(const String &var)
 #endif
 
   if (var == "prog_data")
+  {
     return String(compile_date);
+  }
+  if (var.startsWith("chi_"))
+  {
+    char out[700];
+    char buff[20];
+    int channel_idx = var.substring(4, 5).toInt();
+    if (channel_idx>=CHANNELS)
+      return String();
 
+    strcpy(buff, s.ch[channel_idx].is_up ? "up" : "down");
+    if (s.ch[channel_idx].is_up != s.ch[channel_idx].wanna_be_up)
+      strcat(buff, s.ch[channel_idx].wanna_be_up ? " (rising)" : "(dropping)");
+
+    snprintf(out, 200, "<div class='secbr'><h3>Channel %d</h3></div><div class='fld'><div>Current status: %s</div></div>", channel_idx + 1, buff);
+    get_channel_info_fields(out, channel_idx);
+    Serial.printf("ch_ out len: %d\n", strlen(out));
+    return out;
+  }
+
+  if (var.startsWith("cht_"))
+  {
+    char out[2000];
+    char buff[500];
+    int channel_idx = var.substring(4, 5).toInt();
+    if (channel_idx>=CHANNELS)
+      return String();
+
+    for (int target_idx = 0; target_idx < CHANNEL_TARGETS_MAX; target_idx++)
+    {
+      get_channel_target_fields(buff, channel_idx, target_idx, 500 - 1);
+      strncat(out, buff, 2000 - strlen(out) - 1);
+    }
+    return out;
+  }
   if (var.startsWith("target_ch_"))
   {
     // e.g target_ch_0_1
     char out[500];
     int channel_idx = var.substring(10, 11).toInt();
     int target_idx = var.substring(12, 13).toInt();
-    get_channel_target_fields(out, channel_idx, target_idx);
+    get_channel_target_fields(out, channel_idx, target_idx,500);
     return out;
   }
+  // TODO:remnove old
   if (var.startsWith("info_ch_"))
   {
     char out[500];
     int channel_idx = var.substring(8, 9).toInt();
-    Serial.printf("debug target_ch_: %s %d \n",var.c_str(),channel_idx);
-   // strcpy(out, "MOI");
+    Serial.printf("debug target_ch_: %s %d \n", var.c_str(), channel_idx);
     get_channel_info_fields(out, channel_idx);
     return out;
   }
@@ -1393,17 +1441,18 @@ String setup_form_processor(const String &var)
   {
     return String(s.lon, 2);
   }
-   if (var == "forecast_loc")
+  if (var == "forecast_loc")
   {
     return String(s.forecast_loc);
   }
-  
 
 #ifdef QUERY_POWERGURU_ENABLED
   /*if (var == "pg_url")
     return s.pg_url;*/
   if (var == "pg_host")
     return s.pg_host;
+  if (var == "pg_api_key")
+    return s.pg_api_key;
   if (var == "pg_port")
     return String(s.pg_port);
   if (var == "pg_cache_age")
@@ -1502,7 +1551,7 @@ void set_relays()
 
     s.ch[channel_idx].wanna_be_up = false;
     // loop channel targets until there is match (or no more targets)
-    for (int target_idx = 0; target_idx < CHANNEL_TARGETS_MAX; target_idx++)
+    for (int target_idx = 0; target_idx < channel_target_count(channel_idx); target_idx++)
     {
       // check matching states, i.e. if any of target states matches current active states
       for (int act_state_idx = 0; act_state_idx < active_state_count; act_state_idx++)
@@ -1515,8 +1564,8 @@ void set_relays()
 #ifdef SENSOR_DS18B20_ENABLED
             // TODO: check that sensor value is valid
             //  states are matching, check if the sensor value is below given target (channel should be up) or reached (should be down)
-          //  ch[channel_idx].type==CH_TYPE_ONOFF
-            if ((s.ch[channel_idx].type==CH_TYPE_ONOFF) || (ds18B20_temp_c < s.ch[channel_idx].target[target_idx].target) )
+            //  ch[channel_idx].type==CH_TYPE_ONOFF
+            if ((s.ch[channel_idx].type == CH_TYPE_ONOFF) || (ds18B20_temp_c < s.ch[channel_idx].target[target_idx].target))
             {
               s.ch[channel_idx].wanna_be_up = true;
               s.ch[channel_idx].target[target_idx].target_active = true;
@@ -1605,12 +1654,12 @@ void onWebRootPost(AsyncWebServerRequest *request)
 {
   String message;
 
-  int paramsNr = request->params();
-  Serial.println(paramsNr);
+  //int paramsNr = request->params();
+  // Serial.println(paramsNr);
 
   s.sta_mode = request->hasParam("sta_mode", true);
-  Serial.print("s.sta_mode:");
-  Serial.print(s.sta_mode);
+  // Serial.print("s.sta_mode:");
+  // Serial.print(s.sta_mode);
 
   strcpy(s.wifi_ssid, request->getParam("wifi_ssid", true)->value().c_str());
   strcpy(s.wifi_password, request->getParam("wifi_password", true)->value().c_str());
@@ -1623,16 +1672,15 @@ void onWebRootPost(AsyncWebServerRequest *request)
     s.energy_meter_type = request->getParam("emt", true)->value().toInt();
   }
 
-  //Serial.println(request->getParam("emh", true)->value().c_str());
+  // Serial.println(request->getParam("emh", true)->value().c_str());
   strcpy(s.energy_meter_host, request->getParam("emh", true)->value().c_str());
-  //Serial.println(s.energy_meter_host);
+  // Serial.println(s.energy_meter_host);
   s.energy_meter_port = request->getParam("emp", true)->value().toInt();
   s.energy_meter_id = request->getParam("emid", true)->value().toInt();
 
   s.lat = request->getParam("lat", true)->value().toFloat();
   s.lon = request->getParam("lon", true)->value().toFloat();
   strcpy(s.forecast_loc, request->getParam("forecast_loc", true)->value().c_str());
-  
 
 #ifdef INVERTER_FRONIUS_SOLARAPI_ENABLED
   // strcpy(s.fronius_address, request->getParam("fronius_address", true)->value().c_str());
@@ -1643,38 +1691,39 @@ void onWebRootPost(AsyncWebServerRequest *request)
 #ifdef QUERY_POWERGURU_ENABLED
   // strcpy(s.pg_url, request->getParam("pg_url", true)->value().c_str());
   strcpy(s.pg_host, request->getParam("pg_host", true)->value().c_str());
+  strcpy(s.pg_api_key, request->getParam("pg_api_key", true)->value().c_str());
+
   s.pg_port = request->getParam("pg_port", true)->value().toInt();
-  s.pg_cache_age = request->getParam("pg_cache_age", true)->value().toInt();
+  s.pg_cache_age = max((int)request->getParam("pg_cache_age", true)->value().toInt(),3600);
 #endif
 
   // channel/target fields
   char ch_fld[12];
   char state_fld[8];
   char target_fld[7];
-  
+
   for (int channel_idx = 0; channel_idx < CHANNELS; channel_idx++)
   {
     snprintf(ch_fld, 12, "gpio_ch_%i", channel_idx);
     if (request->hasParam(ch_fld, true))
       s.ch[channel_idx].gpio = request->getParam(ch_fld, true)->value().toInt();
-    else
-      Serial.println(ch_fld);
-
+    //   else
+    //    Serial.println(ch_fld);
 
     snprintf(ch_fld, 12, "id_ch_%i", channel_idx);
     if (request->hasParam(ch_fld, true))
       strcpy(s.ch[channel_idx].id_str, request->getParam(ch_fld, true)->value().c_str());
-    else
-      Serial.println(ch_fld);
+    //  else
+    //    Serial.println(ch_fld);
 
     snprintf(ch_fld, 12, "ch_t_%i", channel_idx);
     if (request->hasParam(ch_fld, true))
       s.ch[channel_idx].type = request->getParam(ch_fld, true)->value().toInt();
-    else
-      Serial.println(ch_fld);
-    //char const *sep_comma = ",";
+    //  else
+    //   Serial.println(ch_fld);
+    // char const *sep_comma = ",";
 
-    for (int target_idx = 0; target_idx < CHANNEL_TARGETS_MAX; target_idx++)
+    for (int target_idx = 0; target_idx < channel_target_count(channel_idx); target_idx++)
     {
       snprintf(state_fld, 8, "st_%i_t%i", channel_idx, target_idx);
       snprintf(target_fld, 7, "t_%i_t%i", channel_idx, target_idx);
@@ -1682,8 +1731,8 @@ void onWebRootPost(AsyncWebServerRequest *request)
       {
 
         str_to_uint_array(request->getParam(state_fld, true)->value().c_str(), s.ch[channel_idx].target[target_idx].upstates, ",");
-       // str_to_uint_array(request->getParam(state_fld, true)->value().c_str(), s.ch[channel_idx].target[target_idx].upstates, sep_comma);
-        Serial.println(request->getParam(target_fld, true)->value().c_str());
+        // str_to_uint_array(request->getParam(state_fld, true)->value().c_str(), s.ch[channel_idx].target[target_idx].upstates, sep_comma);
+        //    Serial.println(request->getParam(target_fld, true)->value().c_str());
         s.ch[channel_idx].target[target_idx].target = request->getParam(target_fld, true)->value().toFloat();
       }
     }
@@ -1692,8 +1741,8 @@ void onWebRootPost(AsyncWebServerRequest *request)
   if (request->hasParam("timesync", true))
   {
     time_t ts = request->getParam("ts", true)->value().toInt();
-   // Serial.print("TIMESTAMP:");
-   // Serial.print(ts);
+    // Serial.print("TIMESTAMP:");
+    // Serial.print(ts);
     setInternalTime(ts);
 #ifdef RTC_DS3231_ENABLED
     if (rtc_found)
@@ -1794,7 +1843,6 @@ void setup()
   EEPROM.begin(sizeof(s));
   readFromEEPROM();
   Serial.print("AFTER READ EEPROM:");
- 
 
   if (s.check_value != 12345)
   {
@@ -1807,19 +1855,22 @@ void setup()
 
     s.ch[0].gpio = 5;
     s.ch[1].gpio = 4;
-      s.lat = 64.96;
+    s.lat = 64.96;
     s.lon = 27.59;
-    for (int channel_idx = 0; channel_idx < CHANNELS; channel_idx++){
+    for (int channel_idx = 0; channel_idx < CHANNELS; channel_idx++)
+    {
       s.ch[channel_idx].type = CH_TYPE_ONOFF;
-      sprintf(s.ch[channel_idx].id_str, "channel %d",channel_idx+1);
-     for (int target_idx = 0; target_idx < CHANNEL_TARGETS_MAX; target_idx++)
+      sprintf(s.ch[channel_idx].id_str, "channel %d", channel_idx + 1);
+      for (int target_idx = 0; target_idx < CHANNEL_TARGETS_MAX; target_idx++)
       {
         s.ch[channel_idx].target[target_idx] = {{}, 0};
       }
     }
- 
+
 #ifdef QUERY_POWERGURU_ENABLED
     strcpy(s.pg_host, "");
+      strcpy(s.pg_api_key, "");
+    
     s.pg_port = 80;
     s.pg_cache_age = 7200;
 #endif
@@ -1962,12 +2013,9 @@ void setup()
    }
    */
 
-
   server_web.onNotFound(notFound);
 
   server_web.begin();
-
-  
 
   Serial.print(F("setup() finished:"));
   Serial.println(ESP.getFreeHeap());
