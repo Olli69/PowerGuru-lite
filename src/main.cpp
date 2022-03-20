@@ -32,8 +32,18 @@ const char compile_date[] = __DATE__ " " __TIME__;
 #define eepromaddr 0
 #define WATT_EPSILON 50
 
-#define CH_TYPE_ONOFF 0
-#define CH_TYPE_ON_UPTO_TARGET 1
+#define CH_TYPE_GPIO_ONOFF 0
+#define CH_TYPE_GPIO_TARGET 1
+#define CH_TYPE_SHELLY_ONOFF 2
+#define CH_TYPE_SHELLY_TARGET 3
+
+/*
+ONOFF 0
+TARGET... 1
+GPIO = 0
+SHELLY = 2
+MODBUS = 4
+*/
 
 #define NETTING_PERIOD_MIN 60 // should be 60, later 15
 
@@ -58,9 +68,6 @@ const char compile_date[] = __DATE__ " " __TIME__;
 - millis exceed long ... - problem???
 - backup for no ntp (rtcmem?), eg. boot or short break
 - channel up/down could be also stored to rtc, only 1 bit needed...
-
-
-
 */
 
 // https://werner.rothschopf.net/202011_arduino_esp8266_ntp_en.htm
@@ -272,6 +279,7 @@ bool restart_required = false;
 
 // data strcuture limits
 //#define CHANNELS 2
+#define CHANNEL_TYPES 4
 #define CHANNEL_TARGETS_MAX 3
 #define CHANNEL_STATES_MAX 10
 #define ACTIVE_STATES_MAX 20
@@ -291,6 +299,7 @@ bool restart_required = false;
 
 // Type texts for config ui
 const char *energym_strings[] PROGMEM = {"none", "Shelly 3EM", "Fronius Solar API", "SMA Modbus TCP"};
+const char *channel_type_strings[] PROGMEM = {"GPIO ON/OFF", "GPIO target", "Shelly ON/OFF", "Shelly target"};
 
 #if defined(INVERTER_FRONIUS_SOLARAPI_ENABLED) || defined(INVERTER_SMA_MODBUS_ENABLED)
 // inverter productuction info fields
@@ -329,7 +338,7 @@ typedef struct
   char http_password[MAX_ID_STR_LENGTH];
   channel_struct ch[CHANNELS];
 #ifdef QUERY_POWERGURU_ENABLED
-  char pg_host[MAX_ID_STR_LENGTH];
+  char pg_host[MAX_URL_STR_LENGTH];
   unsigned int pg_port;
   uint16_t pg_cache_age;
   char pg_api_key[37];
@@ -342,7 +351,7 @@ typedef struct
   bool next_boot_ota_update;
 #endif
   byte energy_meter_type;
-  char energy_meter_host[MAX_ID_STR_LENGTH];
+  char energy_meter_host[MAX_URL_STR_LENGTH];
   unsigned int energy_meter_port;
   byte energy_meter_id;
   float lat;
@@ -930,7 +939,7 @@ byte get_internal_states(uint16_t state_array[CHANNEL_STATES_MAX])
 
 int channel_target_count(int channel_idx)
 {
-  if (s.ch[channel_idx].type == CH_TYPE_ON_UPTO_TARGET)
+  if (s.ch[channel_idx].type & 1) // target channel
     return CHANNEL_TARGETS_MAX;
   else
     return 1;
@@ -1046,21 +1055,22 @@ void refresh_states(time_t current_period_start)
 // https://github.com/me-no-dev/ESPAsyncWebServer#send-large-webpage-from-progmem-containing-templates
 const char setup_form_html[] PROGMEM = R"===(<html>
 <head>
+<title>PowerGuru Node | Dashboard</title>
+<link href='https://fonts.googleapis.com/css?family=Bakbak One' rel='stylesheet'>
 <style>
-        body {background-color: #11744a3b ;margin:1.6em; font-size:20px;font-family: Verdana, Geneva, Tahoma, sans-serif;}
-        p {font-size: 1em;}
+        body {background-color: #1a1e15 ;margin:1.6em; font-size:20px;font-family: 'Roboto', Sans-Serif; color:#f7f7e6}
+        p {font-size: 1em;color:#f7f7e6}
         .code {max-width: 250px;}
-        .btn {background-color: white;}
-      form, #fld, input{
-        width:100%%;
-      }
-      h3 {margin-block-start: 2em;}
+        .btn {background-color: #f7f7e6;}
+      form, #fld, input{ width:100%%;}
+      input[type="text"],input[type="password"], textarea, select, input[type=checkbox], input[type=submit] { background-color : #404040;color:#f7f7e6; border-color:#404040 }
+      h3 {margin-block-start: 1em;}
       input,select {font-size:2em;}
-      input[type=checkbox] {width:50px;height:50px;}
+      input[type=checkbox] {width:40px;height:40px;}
       input[type=submit] {margin-top:30px;}
-      input[type=radio] {width:15px;}
+      input[type=radio] {height:30px;width:auto;}
       .inpnum {text-align: right;}
-      h1,h2,h3 {clear:both;}
+      h1,h2,h3 {clear:both; font-family: 'Bakbak One'; color:#f2ef99;}  
       .fld {margin-top: 10px;clear:both;}
       .secbr {padding-top: 30px;clear:both;}
       .fldh { float:left; width:44%%; margin-right:2%%; }
@@ -1101,15 +1111,13 @@ function fieldCheck(val) {
   else
     emidd.style.display = "none";
 
-  var tdiv;
+  var tdiv,chtype;
   for (var ch=0;ch<CHANNELS;ch++) {
     //ch_t_%d_1
     //TODO: fix if more types coming
-      rbut = document.getElementById('ch_t_' + ch+'_1');
-      if (rbut.checked)
-        setTargetFields(ch,1);
-      else
-        setTargetFields(ch,0);
+      chtype = document.getElementById('chty_' + ch).value;
+      setTargetFields(ch,chtype);
+ 
   }
 }
 
@@ -1119,8 +1127,9 @@ function setTargetFields(ch,chtype) {
     divid = 'td_' + ch + "_" + t;
     var targetdiv =  document.querySelector('#' + divid );
     var statediv =  document.querySelector('#sd_' + ch + "_" + t );
-    
-    if (chtype ==1) {
+    var isTarget = (1 & chtype);
+  
+    if (isTarget) {
       targetdiv.style.display = "block";
       statediv.style.display = "block";
       }
@@ -1136,20 +1145,27 @@ function setTargetFields(ch,chtype) {
 function fieldCheck2(obj) {
   if (obj == null)
     return;
+
+
   const fldA = obj.id.split("_"); 
-  ch = parseInt(fldA[2]);
+  ch = parseInt(fldA[1]);
+
   var chtype = obj.value;
+
+//  alert(ch +","+chtype);
   setTargetFields(ch,chtype);
 }
+
 
 function beforeSubmit() {
  document.querySelector('#ts').value = Date.now()/1000;
 }
 </script>
 <form method="post" onsubmit="beforeSubmit();">
-<div class="secbr"><h3>Status</h3></div>
+<div class="secbr"><h1>PowerGuru Node</h1><h2>Status</h2></div>
 %metered_values%
 <div class="fld">Active states: %states%</div>
+<br><h2>Settings</h2>
 %chi_0% %cht_0%
 %chi_1% %cht_1%
 %chi_2% %cht_2%
@@ -1173,10 +1189,6 @@ function beforeSubmit() {
 </div>
 
 <div class="fld"><div><a href="https://github.com/Olli69/powerguru/blob/main/docs/states.md" target="_blank">State list</a></div></div>
-
-
-
-
 
 <div class="secbr"><h3>WiFi</h3></div>
 <div class="fld"><input type="checkbox" id="sta_mode" name="sta_mode" value="sta_mode" %sta_mode%><label for="sta_mode"> Connect to existing wifi network</label></div>
@@ -1219,18 +1231,39 @@ void get_channel_info_fields(char *out, int channel_idx)
 {
   char buff[200];
   snprintf(buff, 200, "<div><div class='fldh'>id: <input name='id_ch_%d' type='text' value='%s' maxlength='9'></div>", channel_idx, s.ch[channel_idx].id_str);
-  Serial.println(strlen(out));
+  // Serial.println(strlen(out));
   strcat(out, buff);
 
-  snprintf(buff, 200, "<div class='fldshort'>type:<br> <input type='radio' id='ch_t_%d_0' name='ch_t_%d' value='0' onclick='fieldCheck2(this)' %s><label for='ch_t_%d_0'>up</label>", channel_idx, channel_idx, s.ch[channel_idx].type == CH_TYPE_ONOFF ? "checked" : "", channel_idx);
-  Serial.println(strlen(out));
+  snprintf(buff, sizeof(buff), "<div class='fldshort'>type:<select name='chty_%d' id='chty_%d' onchange='fieldCheck2(this)'>", channel_idx, channel_idx);
   strcat(out, buff);
+  bool is_gpio_channel;
+  for (int channel_type_idx = 0; channel_type_idx < CHANNEL_TYPES; channel_type_idx++)
+  {
+    // if gpio channels and non-gpio channels can not be mixed
+    //  tässä kai pitäisi toinen ottaa channelista, toinen loopista
+    is_gpio_channel = (s.ch[channel_idx].gpio != 255);
+    // Serial.printf("is_gpio_channel %d %d %d\n",channel_idx,is_gpio_channel,s.ch[channel_idx].gpio);
 
-  snprintf(buff, 200, "<input type='radio' id='ch_t_%d_1' name='ch_t_%d' value='1' onclick='fieldCheck2(this)' %s><label for='ch_t_%d_1'>target</label></div>", channel_idx, channel_idx, s.ch[channel_idx].type == CH_TYPE_ON_UPTO_TARGET ? "checked" : "", channel_idx);
-  Serial.println(strlen(out));
-  strcat(out, buff);
-  snprintf(buff, 200, "<div class='fldtiny'>uptime: <input name='ch_uptimem_%d' type='text' value='%d'></div></div>", channel_idx, s.ch[channel_idx].uptime_minimum);
-  Serial.println(strlen(out));
+    if ((channel_type_idx >> 1 == 0 && is_gpio_channel) || (channel_type_idx >> 1 != 0 && !is_gpio_channel))
+    {
+      snprintf(buff, sizeof(buff), "<option value='%d' %s>%s</>", channel_type_idx, (s.ch[channel_idx].type == channel_type_idx) ? "selected" : "", channel_type_strings[channel_type_idx]);
+      strcat(out, buff);
+    }
+  }
+  strcat(out, "</select></div>");
+
+  /*
+    snprintf(buff, 200, "<div class='fldshort'>channel type:<br> <input type='radio' id='ch_t_%d_0' name='ch_t_%d' value='0' onclick='fieldCheck2(this)' %s><label for='ch_t_%d_0'>up</label>", channel_idx, channel_idx, s.ch[channel_idx].type == CH_TYPE_ONOFF ? "checked" : "", channel_idx);
+   // Serial.println(strlen(out));
+    strcat(out, buff);
+
+    snprintf(buff, 200, "<input type='radio' id='ch_t_%d_1' name='ch_t_%d' value='1' onclick='fieldCheck2(this)' %s><label for='ch_t_%d_1'>target</label></div>", channel_idx, channel_idx, s.ch[channel_idx].type == CH_TYPE_ON_UPTO_TARGET ? "checked" : "", channel_idx);
+   // Serial.println(strlen(out));
+    strcat(out, buff);
+
+    */
+  snprintf(buff, 200, "<div class='fldtiny'>min uptime: <input name='ch_uptimem_%d' type='text' value='%d'></div></div>", channel_idx, (int)s.ch[channel_idx].uptime_minimum);
+  // Serial.println(strlen(out));
   strcat(out, buff);
 }
 
@@ -1239,26 +1272,26 @@ void get_channel_target_fields(char *out, int channel_idx, int target_idx, int b
   String states = state_array_string(s.ch[channel_idx].target[target_idx].upstates);
   char float_buffer[32]; // to prevent overflow if initiated with a long number...
   dtostrf(s.ch[channel_idx].target[target_idx].target, 3, 1, float_buffer);
-  snprintf(out, buff_len, "<div><div id='sd_%i_%i' class=\"fldlong\">#%i states %s<input name=\"st_%i_t%i\" type=\"text\" value=\"%s\"></div></div><div class=\"fldshort\" id=\"td_%i_%i\">Target:<input class=\"inpnum\" name=\"t_%i_t%i\" type=\"text\" value=\"%s\"></div></div>", channel_idx, target_idx, target_idx + 1, s.ch[channel_idx].target[target_idx].target_active ? "* ACTIVE *" : "", channel_idx, target_idx, states.c_str(), channel_idx, target_idx, channel_idx, target_idx, float_buffer);
+  snprintf(out, buff_len, "<div><div id='sd_%i_%i' class=\"fldlong\">#%i states %s<input name=\"st_%i_%i\" type=\"text\" value=\"%s\"></div></div><div class=\"fldshort\" id=\"td_%i_%i\">Target:<input class=\"inpnum\" name=\"t_%i_%i\" type=\"text\" value=\"%s\"></div></div>", channel_idx, target_idx, target_idx + 1, s.ch[channel_idx].target[target_idx].target_active ? "* ACTIVE *" : "", channel_idx, target_idx, states.c_str(), channel_idx, target_idx, channel_idx, target_idx, float_buffer);
   return;
 }
 
 void get_meter_config_fields(char *out)
 {
-  char buff[150];
+  char buff[200];
   strcpy(out, "<div class='secbr'><h3>Energy meter</h3></div><div class=\"fld\"><select name=\"emt\" id=\"emt\" onchange=\"fieldCheck(this.value)\">");
 
   for (int energym_idx = 0; energym_idx <= ENERGYM_MAX; energym_idx++)
   {
-    snprintf(buff, 150, "<option value=\"%d\" %s>%s</>", energym_idx, (s.energy_meter_type == energym_idx) ? "selected" : "", energym_strings[energym_idx]);
+    snprintf(buff, sizeof(buff), "<option value=\"%d\" %s>%s</>", energym_idx, (s.energy_meter_type == energym_idx) ? "selected" : "", energym_strings[energym_idx]);
     strcat(out, buff);
   }
   strcat(out, "</select></div>");
-  snprintf(buff, 150, "<div id='emhd' class=\"fld\"><div class=\"fldh\">host:<input name=\"emh\" id=\"emh\" type=\"text\" value=\"%s\"></div>", s.energy_meter_host);
+  snprintf(buff, sizeof(buff), "<div id='emhd' class=\"fld\"><div class=\"fldlong\">host:<input name=\"emh\" id=\"emh\" type=\"text\" value=\"%s\"></div>", s.energy_meter_host);
   strcat(out, buff);
-  snprintf(buff, 150, "<div id='empd' class=\"fldtiny\">port:<input name=\"emp\" id=\"emp\" type=\"text\" value=\"%d\"></div>", s.energy_meter_port);
+  snprintf(buff, sizeof(buff), "<div id='empd' class=\"fldtiny\">port:<input name=\"emp\" id=\"emp\" type=\"text\" value=\"%d\"></div>", s.energy_meter_port);
   strcat(out, buff);
-  snprintf(buff, 150, "<div id='emidd' class=\"fldtiny\">unit:<input name=\"emid\" id=\"emid\" type=\"text\" value=\"%d\"></div></div>", s.energy_meter_id);
+  snprintf(buff, sizeof(buff), "<div id='emidd' class=\"fldtiny\">unit:<input name=\"emid\" id=\"emid\" type=\"text\" value=\"%d\"></div></div>", s.energy_meter_id);
   strcat(out, buff);
   // Serial.println(out);
   return;
@@ -1376,7 +1409,7 @@ String setup_form_processor(const String &var)
     char out[800];
     char buff[20];
     int channel_idx = var.substring(4, 5).toInt();
-    if (channel_idx>=CHANNELS)
+    if (channel_idx >= CHANNELS)
       return String();
 
     strcpy(buff, s.ch[channel_idx].is_up ? "up" : "down");
@@ -1385,7 +1418,6 @@ String setup_form_processor(const String &var)
 
     snprintf(out, 200, "<div class='secbr'><h3>Channel %d</h3></div><div class='fld'><div>Current status: %s</div></div>", channel_idx + 1, buff);
     get_channel_info_fields(out, channel_idx);
-    Serial.printf("ch_ out len: %d\n", strlen(out));
     return out;
   }
 
@@ -1394,7 +1426,7 @@ String setup_form_processor(const String &var)
     char out[2000];
     char buff[500];
     int channel_idx = var.substring(4, 5).toInt();
-    if (channel_idx>=CHANNELS)
+    if (channel_idx >= CHANNELS)
       return String();
 
     for (int target_idx = 0; target_idx < CHANNEL_TARGETS_MAX; target_idx++)
@@ -1410,7 +1442,7 @@ String setup_form_processor(const String &var)
     char out[500];
     int channel_idx = var.substring(10, 11).toInt();
     int target_idx = var.substring(12, 13).toInt();
-    get_channel_target_fields(out, channel_idx, target_idx,500);
+    get_channel_target_fields(out, channel_idx, target_idx, 500);
     return out;
   }
   // TODO:remnove old
@@ -1530,6 +1562,41 @@ int get_channel_to_switch(bool is_rise, int switch_count)
   return -1; // we should not end up here
 }
 
+bool set_channel_switch(int channel_idx, bool up)
+{
+  int channel_type_group = (s.ch[channel_idx].type >> 1 << 1); // we do not care about the last bit
+  Serial.printf("set_channel_switch channel_type_group %d \n",channel_type_group);
+  if ((channel_type_group == CH_TYPE_GPIO_ONOFF))
+  {
+    digitalWrite(s.ch[channel_idx].gpio, (up ? HIGH : LOW));
+    return true;
+  }
+  else if (channel_type_group == CH_TYPE_SHELLY_ONOFF)
+  {
+    String url_to_call = "http://" + String(s.energy_meter_host) + ":" + String(s.energy_meter_port) + "/relay/0?turn=";
+    if (up)
+      url_to_call = url_to_call + String("on");
+    else
+      url_to_call = url_to_call + String("off");
+    Serial.println(url_to_call);
+
+    DynamicJsonDocument doc(256);
+    
+    DeserializationError error = deserializeJson(doc, httpGETRequest(url_to_call.c_str(), ""));
+    
+
+    if (error)
+    {
+      Serial.print(F("Shelly relay call deserializeJson() failed: "));
+      Serial.println(error.f_str());
+      return false;
+    }
+    else
+      return true;
+  }
+  return false;
+}
+
 void set_relays()
 {
   int active_state_count = 0;
@@ -1548,20 +1615,22 @@ void set_relays()
   // loop channels and check whether channel should be up
   for (int channel_idx = 0; channel_idx < CHANNELS; channel_idx++)
   { // reset target_active variable
+
+    // if channel is up, keep it up at least minimum time
+    if (s.ch[channel_idx].is_up && ((now - s.ch[channel_idx].toggle_last) < s.ch[channel_idx].uptime_minimum))
+    {
+      Serial.printf("Not yet time to drop channel %d . Since last toggle %d\n", channel_idx, (int)(now - s.ch[channel_idx].toggle_last));
+      s.ch[channel_idx].wanna_be_up = true;
+      continue;
+    }
+
     for (int target_idx = 0; target_idx < CHANNEL_TARGETS_MAX; target_idx++)
     {
       s.ch[channel_idx].target[target_idx].target_active = false;
     }
     target_state_match_found = false;
 
-    //experimental
-    // if channel is up, keep it up at least minimum time 
-    if (s.ch[channel_idx].is_up && ((now-s.ch[channel_idx].toggle_last)<s.ch[channel_idx].uptime_minimum)) {
-      s.ch[channel_idx].wanna_be_up = true;
-      break;
-    }
-
-     s.ch[channel_idx].wanna_be_up = false;
+    s.ch[channel_idx].wanna_be_up = false;
     // loop channel targets until there is match (or no more targets)
     for (int target_idx = 0; target_idx < channel_target_count(channel_idx); target_idx++)
     {
@@ -1577,7 +1646,7 @@ void set_relays()
             // TODO: check that sensor value is valid
             //  states are matching, check if the sensor value is below given target (channel should be up) or reached (should be down)
             //  ch[channel_idx].type==CH_TYPE_ONOFF
-            if ((s.ch[channel_idx].type == CH_TYPE_ONOFF) || (ds18B20_temp_c < s.ch[channel_idx].target[target_idx].target))
+            if (!(s.ch[channel_idx].type & 1) || (ds18B20_temp_c < s.ch[channel_idx].target[target_idx].target))
             {
               s.ch[channel_idx].wanna_be_up = true;
               s.ch[channel_idx].target[target_idx].target_active = true;
@@ -1614,7 +1683,7 @@ void set_relays()
   int switchings_to_todo;
   bool is_rise;
   int oper_count;
-  
+
   for (int drop_rise = 0; drop_rise < 2; drop_rise++)
   { // first round drops, second rises
     is_rise = (drop_rise == 1);
@@ -1627,7 +1696,8 @@ void set_relays()
       s.ch[ch_to_switch].is_up = is_rise;
       s.ch[ch_to_switch].toggle_last = now;
 
-      digitalWrite(s.ch[ch_to_switch].gpio, (s.ch[ch_to_switch].is_up ? HIGH : LOW));
+      // digitalWrite(s.ch[ch_to_switch].gpio, (s.ch[ch_to_switch].is_up ? HIGH : LOW));
+      set_channel_switch(ch_to_switch, s.ch[ch_to_switch].is_up);
     }
   }
 }
@@ -1669,8 +1739,8 @@ void onWebRootPost(AsyncWebServerRequest *request)
 {
   String message;
 
-  //int paramsNr = request->params();
-  // Serial.println(paramsNr);
+  // int paramsNr = request->params();
+  //  Serial.println(paramsNr);
 
   s.sta_mode = request->hasParam("sta_mode", true);
   // Serial.print("s.sta_mode:");
@@ -1709,39 +1779,39 @@ void onWebRootPost(AsyncWebServerRequest *request)
   strcpy(s.pg_api_key, request->getParam("pg_api_key", true)->value().c_str());
 
   s.pg_port = request->getParam("pg_port", true)->value().toInt();
-  s.pg_cache_age = max((int)request->getParam("pg_cache_age", true)->value().toInt(),3600);
+  s.pg_cache_age = max((int)request->getParam("pg_cache_age", true)->value().toInt(), 3600);
 #endif
 
   // channel/target fields
-  char ch_fld[15];
-  char state_fld[15];
-  char target_fld[15];
+  char ch_fld[20];
+  char state_fld[20];
+  char target_fld[20];
 
   for (int channel_idx = 0; channel_idx < CHANNELS; channel_idx++)
   {
-    snprintf(ch_fld, 15, "ch_uptimem_%i", channel_idx);  
+    snprintf(ch_fld, 20, "ch_uptimem_%i", channel_idx);
     Serial.println(ch_fld);
-    if (request->hasParam(ch_fld, true)) {
+    if (request->hasParam(ch_fld, true))
+    {
       s.ch[channel_idx].uptime_minimum = request->getParam(ch_fld, true)->value().toInt();
       Serial.println(s.ch[channel_idx].uptime_minimum);
     }
 
-
-    snprintf(ch_fld, 15, "id_ch_%i", channel_idx);
+    snprintf(ch_fld, 20, "id_ch_%i", channel_idx);
     if (request->hasParam(ch_fld, true))
       strcpy(s.ch[channel_idx].id_str, request->getParam(ch_fld, true)->value().c_str());
     //  else
     //    Serial.println(ch_fld);
 
-    snprintf(ch_fld, 15, "ch_t_%i", channel_idx);
+    snprintf(ch_fld, 20, "chty_%i", channel_idx);
+
     if (request->hasParam(ch_fld, true))
       s.ch[channel_idx].type = request->getParam(ch_fld, true)->value().toInt();
 
-
     for (int target_idx = 0; target_idx < channel_target_count(channel_idx); target_idx++)
     {
-      snprintf(state_fld, 8, "st_%i_t%i", channel_idx, target_idx);
-      snprintf(target_fld, 7, "t_%i_t%i", channel_idx, target_idx);
+      snprintf(state_fld, 20, "st_%i_%i", channel_idx, target_idx);
+      snprintf(target_fld, 20, "t_%i_%i", channel_idx, target_idx);
       if (request->hasParam(state_fld, true))
       {
 
@@ -1857,9 +1927,6 @@ void setup()
 
   EEPROM.begin(sizeof(s));
   readFromEEPROM();
- 
-
- 
 
   if (s.check_value != 12345)
   {
@@ -1873,7 +1940,7 @@ void setup()
     s.lon = 27.59;
     for (int channel_idx = 0; channel_idx < CHANNELS; channel_idx++)
     {
-      s.ch[channel_idx].type = CH_TYPE_ONOFF;
+      s.ch[channel_idx].type = 0; // GPIO_ONOFF
       sprintf(s.ch[channel_idx].id_str, "channel %d", channel_idx + 1);
       for (int target_idx = 0; target_idx < CHANNEL_TARGETS_MAX; target_idx++)
       {
@@ -1884,7 +1951,7 @@ void setup()
 #ifdef QUERY_POWERGURU_ENABLED
     strcpy(s.pg_host, "");
     strcpy(s.pg_api_key, "");
-    
+
     s.pg_port = 80;
     s.pg_cache_age = 7200;
 #endif
@@ -1902,7 +1969,6 @@ void setup()
     writeToEEPROM();
   }
 
-
   // split comma separated gpio string to an array
   uint16_t channel_gpios[CHANNELS];
   str_to_uint_array(CH_GPIOS, channel_gpios, ",");
@@ -1914,9 +1980,12 @@ void setup()
     s.ch[channel_idx].wanna_be_up = false;
     s.ch[channel_idx].is_up = false;
 
-    pinMode(s.ch[channel_idx].gpio, OUTPUT);
-    digitalWrite(s.ch[channel_idx].gpio, (s.ch[channel_idx].is_up ? HIGH : LOW));
+    if ((s.ch[channel_idx].type >> 1) == 0) //gpio channel
+      pinMode(s.ch[channel_idx].gpio, OUTPUT);
+      
     Serial.println((s.ch[channel_idx].is_up ? "HIGH" : "LOW"));
+    set_channel_switch(channel_idx, s.ch[channel_idx].is_up);
+    
   }
 
   /*
@@ -2039,7 +2108,6 @@ void setup()
 
   Serial.print(F("setup() finished:"));
   Serial.println(ESP.getFreeHeap());
-  
 
 #ifdef QUERY_POWERGURU_ENABLED
   // powerguru_last_refresh = -powerguru_interval_s * 1000;
